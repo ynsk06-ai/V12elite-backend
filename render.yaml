@@ -10,3 +10,6 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+    envVars:
+      - key: GROQ_API_KEY
+        value: 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
