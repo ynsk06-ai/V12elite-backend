@@ -720,18 +720,19 @@ async def get_ohlcv(ticker: str, tf: str = "D"):
     k = f"ohlcv_{ticker}_{tf}"
     cached = cget(k)
     if cached:
-        return {"ticker": ticker, "tf": tf, "bars": len(cached), "data": cached}
+        return {"ticker": ticker, "tf": tf, "bars": len(cached), "ohlcv": cached, "data": cached}
 
     ohlcv = await fetch_ohlcv(ticker, tf)
     xu100 = await fetch_xu100_closes()
 
     if not ohlcv:
-        return {"ticker": ticker, "tf": tf, "bars": 0, "data": [], "error": "Veri alinamadi"}
+        return {"ticker": ticker, "tf": tf, "bars": 0, "ohlcv": [], "data": [], "error": "Veri alinamadi"}
 
     return {
         "ticker":    ticker,
         "tf":        tf,
         "bars":      len(ohlcv),
+        "ohlcv":     ohlcv,
         "data":      ohlcv,
         "xu100_last": xu100[-1] if xu100 else None,
     }
@@ -842,6 +843,51 @@ async def scan_stocks(body:dict):
     return {"signals":results,"count":len(results),"tf":tf}
 
 
+
+
+@app.post("/scan_single")
+async def scan_single(body: dict):
+    """
+    Tek hisse icin Pine Script tablolarini cek.
+    { "ticker": "EREGL", "tf": "D", "cfg": {} }
+    """
+    ticker = body.get("ticker", "").upper()
+    tf     = body.get("tf", "D")
+    cfg_in = body.get("cfg", {})
+    if not ticker:
+        return {"error": "ticker gerekli"}
+    
+    # Mevcut scan endpoint'i tek hisse ile cagir
+    result = await scan_stocks({
+        "tickers": [ticker],
+        "tf": tf,
+        "cfg": cfg_in,
+        "min_consensus": 0,  # filtre yok, tum veriyi don
+        "only_master": False
+    })
+    
+    sigs = result.get("signals", [])
+    if sigs:
+        return {"ticker": ticker, "tf": tf, "found": True, "data": sigs[0]}
+    
+    # Sinyal yoksa bile istatistikleri don - proxy hesaplar
+    # Direkt fetch_ohlcv + hesaplama yap
+    try:
+        ohlcv = await fetch_ohlcv(ticker, tf)
+        xu100 = await fetch_xu100_closes()
+        if not ohlcv:
+            return {"ticker": ticker, "tf": tf, "found": False, "error": "Veri alinamadi"}
+        
+        cfg = {"st_len": 10, "st_mult": cfg_in.get("atrm", 3.0),
+               "fb": cfg_in.get("fb", 80), "sc": cfg_in.get("sc", 5),
+               "adx_min": cfg_in.get("adxMin", 25)}
+        
+        sig = calc_signal(ticker, ohlcv, xu100 or [], cfg)
+        if sig:
+            return {"ticker": ticker, "tf": tf, "found": True, "data": sig}
+        return {"ticker": ticker, "tf": tf, "found": False, "data": None}
+    except Exception as e:
+        return {"ticker": ticker, "tf": tf, "found": False, "error": str(e)}
 
 # ── HTML Serve ────────────────────────────────────────
 
@@ -1092,6 +1138,12 @@ async def ai_providers():
         "together": {"active": bool(TOGETHER_API_KEY), "model": "Llama-3.3-70B",          "cost": "$0.0009/1K", "limit": "-"},
         "anthropic":{"active": bool(ANTHROPIC_KEY),   "model": "Claude Haiku 4.5",        "cost": "$0.0008/1K", "limit": "-"},
     }
+
+
+
+
+
+
 
 
 
@@ -10782,7 +10834,7 @@ function updateChatStatus(online){
       +'.soc-panel.active{display:flex;flex-direction:column}'
 
       // Auth modal
-      +'#authModal{position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:9999;display:none;align-items:center;justify-content:center}'
+      +'#authModal{position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:10003;display:none;align-items:center;justify-content:center}'
       +'#authModal.on{display:flex}'
       +'.auth-box{background:var(--bg2);border:1px solid rgba(0,212,255,.2);border-radius:18px;padding:28px 24px;width:320px;max-width:90vw}'
       +'.auth-title{font-size:20px;font-weight:800;color:var(--t1);margin-bottom:4px}'
@@ -12796,7 +12848,7 @@ function showFirstRunDisclaimer(){
     var overlay = document.createElement('div');
     overlay.id = 'firstRunDisc';
     overlay.style.cssText =
-      'position:fixed;inset:0;background:rgba(0,0,0,.96);z-index:9999;'
+      'position:fixed;inset:0;background:rgba(0,0,0,.96);z-index:10001;'
       +'display:flex;align-items:flex-end;justify-content:center;'
       +'padding:0 0 env(safe-area-inset-bottom) 0;';
     overlay.innerHTML =
@@ -12836,14 +12888,19 @@ function showFirstRunDisclaimer(){
 window.acceptDisclaimer = function(){
   try{
     localStorage.setItem('bist_disc_accepted','1');
+    // firstRunDisc overlay'ini kaldir
     var overlay = document.getElementById('firstRunDisc');
     if(overlay){
       overlay.style.transition = 'opacity .3s';
       overlay.style.opacity = '0';
-      setTimeout(function(){ if(overlay.parentNode) overlay.parentNode.removeChild(overlay); },300);
+      setTimeout(function(){ try{ if(overlay.parentNode) overlay.parentNode.removeChild(overlay); }catch(e){} },300);
     }
+    // onboardOverlay varsa onu da kapat
+    var ob = document.getElementById('onboardOverlay');
+    if(ob) ob.style.display = 'none';
     if(typeof haptic === 'function') haptic('success');
-  }catch(e){}
+    if(typeof toast === 'function') toast('Hos geldiniz!');
+  }catch(e){ console.warn('acceptDisclaimer:',e); }
 };
 
 //  7. HAKKINDA PANELI 
@@ -15549,6 +15606,2230 @@ window.addEventListener('load', function(){
 })();
 
 </script>
+<script>
+
+// BIST PRO v3 - BLOK 26: KAPSAMLI HATA DUZELTMESI
+// HATA-1: closeM parametresi
+// HATA-2: setActiveModel onclick
+// HATA-3: idxchips eksik endeksler
+// HATA-4: duplicate STOCKS temizligi
+// HATA-5/6: renderDevPanel + v13CallAPI son override
+// HATA-7: opacity transition tiklama bloke
+// HATA-8/9: startScan + renderSigs zincir duzeltme
+// HATA-10: S.scanIdx vs S.idxFilter unifikasyonu
+
+(function(){
+'use strict';
+
+//  HATA-1: closeM DUZELTME 
+// Eski: closeM(e) - e.target kontrol
+// Yeni: closeM() - direkt kapat, overlay click icin ayri handler
+window.closeM = function(e){
+  try{
+    var modal = document.getElementById('modal');
+    if(!modal) return;
+    // e varsa overlay click - sadece overlay'e tiklandiysa kapat
+    if(e && e.target && e.target.id !== 'modal') return;
+    modal.classList.remove('on');
+    // mcont temizle
+    var mcont = document.getElementById('mcont');
+    if(mcont) setTimeout(function(){ mcont.innerHTML = ''; }, 300);
+  }catch(ex){ console.warn('closeM:',ex.message); }
+};
+
+//  HATA-2: setActiveModel onclick DUZELTME 
+// openModelSelector icindeki onclick escaping sorunu
+// setActiveModel dogrudan global'e ata
+if(typeof setActiveModel === 'function'){
+  window.setActiveModel = setActiveModel;
+} else {
+  window.setActiveModel = function(providerId, modelId){
+    try{
+      window._currentProvider = providerId;
+      window._currentModel = modelId;
+      try{
+        localStorage.setItem('bist_active_provider', providerId);
+        localStorage.setItem('bist_active_model', modelId);
+      }catch(e){}
+      // Badge guncelle
+      if(typeof updateModelBadge === 'function') updateModelBadge();
+      closeM();
+      if(typeof toast === 'function'){
+        var mc = window.MODEL_CATALOG;
+        var prov = mc && mc[providerId];
+        var mod = prov && prov.models && prov.models.find(function(m){return m.id===modelId;});
+        toast((mod ? mod.name : modelId) + ' secildi');
+      }
+    }catch(e){ console.warn('setActiveModel:',e.message); }
+  };
+}
+
+//  HATA-3: idxchips EKSIK ENDEKSLER 
+// Mevcut HTML'de sadece Katilim endeksleri var (XK030EA vs)
+// XU030/XU050/XU100/XBANK vs eksik - ekle
+window.addEventListener('load', function(){
+  setTimeout(function(){
+    try{
+      var idxchips = document.getElementById('idxchips');
+      if(!idxchips) return;
+
+      // Mevcut chip'ler
+      var existing = [];
+      idxchips.querySelectorAll('.chip').forEach(function(ch){
+        existing.push(ch.getAttribute('data-v'));
+      });
+
+      // Eklenecek yeni endeksler
+      var newChips = [
+        {v:'XU030',l:'BIST30'}, {v:'XU050',l:'BIST50'}, {v:'XU100',l:'BIST100'},
+        {v:'XBANK',l:'Bankalar'}, {v:'XHOLD',l:'Holding'}, {v:'XELKT',l:'Enerji'},
+        {v:'XINSA',l:'Insaat'}, {v:'XGIDA',l:'Gida'}, {v:'XMESY',l:'Sanayi'},
+        {v:'XKMYA',l:'Kimya'}, {v:'XTEKS',l:'Tekstil'}, {v:'XULAS',l:'Ulasim'},
+        {v:'XBLSM',l:'Bilisim'}, {v:'XSGRT',l:'Sigorta'}, {v:'XMADN',l:'Maden'},
+        {v:'XTAST',l:'Tas/Cam'}, {v:'XTCRT',l:'Ticaret'}, {v:'XGMYO',l:'GYO'},
+        {v:'XTRZM',l:'Turizm'}, {v:'XSPOR',l:'Spor'},
+      ];
+
+      newChips.forEach(function(ch){
+        if(existing.indexOf(ch.v) > -1) return; // Zaten var
+        var div = document.createElement('div');
+        div.className = 'chip';
+        div.setAttribute('data-v', ch.v);
+        div.setAttribute('onclick', 'idxT(this)');
+        div.textContent = ch.l;
+        div.style.cssText = 'background:rgba(255,184,0,.08);border-color:rgba(255,184,0,.2);color:rgba(255,184,0,.8)';
+        idxchips.appendChild(div);
+      });
+
+      console.log('idxchips guncellendi: '+(newChips.length)+' endeks eklendi');
+    }catch(e){ console.warn('idxchips fix:',e.message); }
+  }, 800);
+}, {once:true, passive:true});
+
+//  HATA-4: DUPLICATE STOCKS TEMIZLIGI 
+// NEW_STOCKS Blok20'de 45 duplicate var, getStocks() ile calistirma sorunu
+setTimeout(function(){
+  try{
+    if(typeof STOCKS === 'undefined') return;
+    var seen = {};
+    var cleaned = STOCKS.filter(function(s){
+      if(seen[s.t]) return false;
+      seen[s.t] = true;
+      return true;
+    });
+    var removed = STOCKS.length - cleaned.length;
+    STOCKS.length = 0;
+    cleaned.forEach(function(s){ STOCKS.push(s); });
+    if(removed > 0) console.log('Duplicate hisse temizlendi: '+removed+' / Toplam: '+STOCKS.length);
+  }catch(e){ console.warn('duplicate fix:',e.message); }
+}, 100);
+
+//  HATA-5: renderDevPanel SON GECERLI 
+// 10x override var - en kapsamli olan renderV15Settings (Blok14)
+// Tum onceki override'lari iptal et, temiz yaz
+setTimeout(function(){
+  try{
+    if(typeof renderV15Settings === 'function'){
+      window.renderDevPanel = function(){
+        try{
+          // page-dev hazirla
+          var devPg = document.getElementById('page-dev');
+          if(!devPg){
+            var mainEl = document.querySelector('main');
+            if(mainEl){ devPg = document.createElement('div'); devPg.id='page-dev'; devPg.className='page'; mainEl.appendChild(devPg); }
+          }
+          renderV15Settings();
+        }catch(e){ console.warn('renderDevPanel:',e.message); }
+      };
+      console.log('renderDevPanel -> renderV15Settings (SABITLENDI)');
+    }
+  }catch(e){}
+}, 500);
+
+//  HATA-6: v13CallAPI SON GECERLI 
+// 6x override - Blok23'teki en kapsamli versiyon kullanilmali
+// Blok23'ten sonra Blok26 geliyor - o versiyon korunacak
+// Sadece tip kontrolu ekle
+setTimeout(function(){
+  try{
+    var current = window.v13CallAPI;
+    if(typeof current !== 'function'){
+      // Yedek basit implementasyon
+      window.v13CallAPI = function(msg){
+        if(!msg || !msg.trim()) return;
+        var PROXY = typeof PROXY_URL!=='undefined' ? PROXY_URL : 'https://bist-price-proxy.onrender.com';
+        fetch(PROXY+'/ai/chat',{
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({message:msg, agent:'main', bist_context:{}})
+        }).then(function(r){return r.json();})
+        .then(function(d){
+          if(typeof v13AppendMsg==='function') v13AppendMsg('ai', d.response||'Yanit yok');
+        }).catch(function(e){
+          if(typeof v13AppendMsg==='function') v13AppendMsg('sys','Hata: '+e.message);
+        });
+      };
+      console.log('v13CallAPI yedek eklendi');
+    } else {
+      console.log('v13CallAPI mevcut versiyon korundu');
+    }
+  }catch(e){}
+}, 600);
+
+//  HATA-7: opacity TRANSITION TIKLAMA BLOKE 
+// Blok25'te .page:not(.on){ pointer-events:none } var - DOGRU
+// AMA gecis sirasinda opacity animation 0.15s suruyor
+// Bu sure icinde tiklama bazen bloke olabiliyor
+// Cozum: transition'i kaldir, anlik goster/gizle
+(function(){
+  try{
+    var st = document.createElement('style');
+    st.textContent =
+      // Blok25'teki transition'i override et - anlik gecis
+      '.page{ transition: none !important; }'
+      +'.page:not(.on){ display: none !important; opacity: 1 !important; pointer-events: none !important; }'
+      +'.page.on{ display: block !important; opacity: 1 !important; pointer-events: all !important; }'
+      // Istisnalar: flex layout gerektiren sayfalar
+      +'#page-social.on{ display: flex !important; flex-direction: column !important; }'
+      +'#page-agents.on{ display: flex !important; flex-direction: column !important; }'
+    ;
+    document.head.appendChild(st);
+  }catch(e){}
+})();
+
+//  HATA-8/9: startScan + renderSigs ZINCIR DUZELTME 
+// Blok24'teki chain wrap'i guncelle - _last* referanslari stale olabilir
+// Dogrudan Blok7'deki son resmi versiyonu bul ve koru
+setTimeout(function(){
+  try{
+    // startScan - su anki versiyon calisiyorsa dokuntma
+    var curSS = window.startScan;
+    if(typeof curSS === 'function'){
+      window.startScan = function(){
+        try{
+          if(typeof guardS === 'function') guardS();
+          // Scan butonu UI feedback
+          var btn = document.getElementById('scanBtn');
+          if(btn && !btn.classList.contains('scanning')){
+            btn.classList.add('scanning');
+            btn.textContent = 'Taraniyor...';
+            btn.disabled = true;
+          }
+          curSS();
+        }catch(e){
+          console.warn('startScan error:',e.message);
+          var btn = document.getElementById('scanBtn');
+          if(btn){ btn.disabled=false; btn.textContent='TARA'; btn.classList.remove('scanning'); }
+        }
+      };
+    }
+  }catch(e){}
+}, 700);
+
+//  HATA-10: S.scanIdx vs S.idxFilter UNIFIKASYONU 
+// getStocks() S.scanIdx kullaniyor
+// idxT() S.idxFilter kullaniyor
+// Bunlari eslestir: idxT() S.scanIdx'i de guncellesin
+setTimeout(function(){
+  try{
+    var origIdxT = typeof idxT === 'function' ? idxT : null;
+    if(origIdxT){
+      window.idxT = function(el){
+        try{
+          origIdxT(el);
+          // S.idxFilter'i S.scanIdx ile senkronize et
+          if(typeof S !== 'undefined'){
+            if(S.idxFilter === 'ALL'){
+              S.scanIdx = 'ALL';
+            } else if(Array.isArray(S.idxFilter) && S.idxFilter.length > 0){
+              S.scanIdx = S.idxFilter[0]; // Birden fazla varsa ilkini al
+            }
+          }
+        }catch(e){ console.warn('idxT:',e.message); }
+      };
+    }
+  }catch(e){}
+}, 900);
+
+//  GENEL DUZELTME: pg() GECIS 
+// Blok25'teki pg() override zaten var ama display:none ile catisiyor
+// Blok26 page gosterme logigini display ile yapalim
+setTimeout(function(){
+  try{
+    var prevPg = window.pg;
+    window.pg = function(name){
+      try{
+        // Tum sayfalari gizle
+        document.querySelectorAll('.page').forEach(function(p){
+          p.classList.remove('on');
+        });
+        // Tum tablari pasif yap
+        document.querySelectorAll('.tab').forEach(function(t){
+          t.classList.remove('on');
+        });
+        // Hedef sayfayi bul/olustur
+        var pageEl = document.getElementById('page-'+name);
+        if(!pageEl){
+          var mainEl = document.querySelector('main');
+          if(mainEl){
+            pageEl = document.createElement('div');
+            pageEl.id = 'page-' + name;
+            pageEl.className = 'page';
+            mainEl.appendChild(pageEl);
+          }
+        }
+        if(pageEl) pageEl.classList.add('on');
+        // Ilgili tab'i aktif et
+        document.querySelectorAll('.tab').forEach(function(t){
+          var oc = t.getAttribute('onclick') || '';
+          var tid = t.id || '';
+          if(oc.indexOf("'"+name+"'") > -1 || tid === name+'Tab'){
+            t.classList.add('on');
+          }
+        });
+        // Sayfa ozel render
+        if(name==='positions') try{renderPositions();}catch(e){}
+        if(name==='watchlist')  try{renderWatchlist();}catch(e){}
+        if(name==='report')     try{renderReport();}catch(e){}
+        if(name==='social')     try{renderSocialPage();}catch(e){}
+        if(name==='dev')        try{renderDevPanel();}catch(e){}
+      }catch(e){
+        console.warn('pg('+name+') error:',e.message);
+      }
+    };
+  }catch(e){}
+}, 200);
+
+//  BONUS: openModelSelector DUZELTME 
+// Escaping sorunu olmadan model secim
+setTimeout(function(){
+  try{
+    if(typeof MODEL_CATALOG === 'undefined') return;
+    var origOMS = typeof openModelSelector === 'function' ? openModelSelector : null;
+    window.openModelSelector = function(){
+      try{
+        var mtit = document.getElementById('mtit');
+        var mcont = document.getElementById('mcont');
+        var modal = document.getElementById('modal');
+        if(!modal) return;
+        if(mtit) mtit.textContent = 'Model Sec';
+
+        var prov = window._currentProvider || 'anthropic';
+        var curMod = window._currentModel || '';
+
+        var html = '<div style="padding:3px 0">';
+        // Aktif model goster
+        var curCat = MODEL_CATALOG[prov];
+        var curModObj = curCat && curCat.models && curCat.models.find(function(m){return m.id===curMod;});
+        html += '<div style="background:rgba(0,212,255,.06);border:1px solid rgba(0,212,255,.15);border-radius:9px;padding:10px;margin-bottom:10px">'
+          +'<div style="font-size:9px;color:var(--t4);margin-bottom:3px">AKTIF MODEL</div>'
+          +'<div style="font-size:12px;font-weight:700;color:var(--cyan)">'+(curModObj?curModObj.name:curMod)+'</div>'
+          +'</div>';
+
+        // Provider gruplu model listesi
+        Object.keys(MODEL_CATALOG).forEach(function(pid){
+          var p = MODEL_CATALOG[pid];
+          if(!p || !p.models || !p.models.length) return;
+          html += '<div style="font-size:9px;font-weight:700;color:'+(p.color||'var(--t4)')+';text-transform:uppercase;letter-spacing:1.5px;margin:8px 0 4px">'
+            +(p.icon||'')+' '+p.name+'</div>';
+          p.models.forEach(function(m){
+            var isActive = m.id === curMod && pid === prov;
+            html += '<div id="msel_'+m.id.replace(/[^a-z0-9]/gi,'_')+'" '
+              +'style="display:flex;align-items:center;gap:8px;padding:9px 10px;background:'
+              +(isActive?'rgba(0,212,255,.1)':'rgba(255,255,255,.03)')
+              +';border:1px solid '+(isActive?'rgba(0,212,255,.3)':'rgba(255,255,255,.06)')
+              +';border-radius:8px;margin-bottom:4px;cursor:pointer" '
+              +'onclick="setActiveModel(\''+pid+'\',\''+m.id+'\');closeM();">'
+              +'<div style="flex:1"><div style="font-size:10px;font-weight:600;color:var(--t1)">'+m.name+'</div>'
+              +'<div style="font-size:8px;color:var(--t4)">'+m.id+'</div></div>'
+              +(isActive?'<span style="font-size:14px;color:var(--cyan)">&#10003;</span>':'')
+              +'</div>';
+          });
+        });
+        html += '</div>';
+        if(mcont) mcont.innerHTML = html;
+        modal.classList.add('on');
+      }catch(e){ console.warn('openModelSelector:',e.message); }
+    };
+  }catch(e){}
+}, 1000);
+
+//  BASLATMA LOGU 
+setTimeout(function(){
+  try{
+    var stockCount = typeof STOCKS !== 'undefined' ? STOCKS.length : 0;
+    console.log('[BIST Elite v3] Blok26 hazir | Hisseler: '+stockCount);
+    if(typeof devLog === 'function'){
+      devLog('Blok26: 10 kritik hata duzeltildi | Hisse: '+stockCount, 'ok');
+    }
+  }catch(e){}
+}, 1500);
+
+})();
+
+</script>
+<script>
+
+// BIST ELITE v3 - BLOK 27: PWA KRITIK DUZELTMELER
+// 1. Zoom engeli (user-scalable, touch-action)
+// 2. Arka plan tarama - visibilitychange, uygulama gizlenince dur, geri gelince devam
+// 3. Tam kalicilik - tfFilter, idxFilter, sigs, openPositions, closedPositions, watchlist
+// 4. S.sigs acilista localStorage'dan yukle
+// 5. saveSets - tum ayarlar kaydedilsin
+// 6. Uygulama resume - tarama durumu korunacak
+
+(function(){
+'use strict';
+
+//  1. ZOOM ENGELI 
+(function(){
+  try{
+    // Viewport meta - user-scalable=no ekle
+    var vp = document.querySelector('meta[name="viewport"]');
+    if(vp){
+      var content = vp.getAttribute('content') || '';
+      if(content.indexOf('user-scalable') === -1){
+        vp.setAttribute('content', content + ',user-scalable=no,maximum-scale=1.0');
+      }
+    }
+    // CSS touch-action ve double-tap zoom engeli
+    var st = document.createElement('style');
+    st.textContent =
+      // Tum elementlerde double-tap zoom engeli
+      '*{ touch-action: manipulation; }'
+      // Ama scroll gereken yerler haric
+      +'.chat-messages, .dm-list, .sdcontent, main, .soc-panel, .forum-topics, #mcont{'
+      +'  touch-action: pan-y !important;'
+      +'}'
+      // iOS pinch zoom engeli
+      +'html, body{ touch-action: none; overflow: hidden; }'
+      +'main{ overflow-y: auto; -webkit-overflow-scrolling: touch; touch-action: pan-y; }'
+      // Butonlarda highlight kaldir
+      +'button, a, [onclick]{ -webkit-tap-highlight-color: transparent; }'
+    ;
+    document.head.appendChild(st);
+  }catch(e){}
+})();
+
+//  2. ARKA PLAN TARAMA YONETIMI 
+var _scanPaused = false;
+var _scanWasRunning = false;
+var _lastScanSaveTime = 0;
+
+document.addEventListener('visibilitychange', function(){
+  try{
+    if(document.hidden){
+      // Uygulama arka plana alindi
+      _scanPaused = true;
+      _scanWasRunning = !!(typeof S !== 'undefined' && S.autoTimer);
+      // Timer'i durdur - pil ve network tasarrufu
+      if(typeof S !== 'undefined' && S.autoTimer){
+        clearInterval(S.autoTimer);
+        S.autoTimer = null;
+      }
+      // Anlik state'i kaydet
+      _saveAllState();
+    } else {
+      // Uygulama on plana geldi
+      _scanPaused = false;
+      // State yukle
+      _loadDeltaState();
+      // Tarama devam etsin - yeni timer baslat (startScan degil, sadece timer)
+      if(_scanWasRunning && typeof S !== 'undefined' && !S.autoTimer){
+        _resumeAutoTimer();
+      }
+    }
+  }catch(e){ console.warn('visibilitychange:',e.message); }
+});
+
+// iOS'ta PWA arka plan - pageshow/pagehide (Safari)
+window.addEventListener('pagehide', function(e){
+  try{
+    _saveAllState();
+  }catch(e){}
+}, false);
+
+window.addEventListener('pageshow', function(e){
+  try{
+    if(e.persisted){
+      // Sayfa cache'den geri geldi (bfcache)
+      _loadDeltaState();
+      if(_scanWasRunning) _resumeAutoTimer();
+    }
+  }catch(e){}
+}, false);
+
+// Auto timer resume - startScan'i tekrar cagirmadan sadece timer'i yeniden baslat
+function _resumeAutoTimer(){
+  try{
+    if(typeof S === 'undefined') return;
+    if(S.autoTimer) return;
+    var mins = parseInt((typeof C !== 'undefined' && C.scanInterval) || 5);
+    if(S.nextScanIn <= 0) S.nextScanIn = mins * 60;
+    S.autoTimer = setInterval(function(){
+      try{
+        if(_scanPaused) return;
+        S.nextScanIn--;
+        if(S.nextScanIn <= 0){
+          S.nextScanIn = mins * 60;
+          if(typeof startScan === 'function') startScan();
+        }
+        // Countdown UI
+        var cntEl = document.getElementById('nextScanCountdown') || document.getElementById('bgText');
+        if(cntEl){
+          var m = Math.floor(S.nextScanIn/60), s = S.nextScanIn%60;
+          cntEl.textContent = m + ':' + (s<10?'0':'') + s;
+        }
+      }catch(ex){}
+    }, 1000);
+  }catch(e){ console.warn('resumeTimer:',e.message); }
+}
+
+//  3. TAM KALICILIK 
+function _saveAllState(){
+  try{
+    if(typeof S === 'undefined') return;
+    // Sinyaller
+    if(S.sigs && S.sigs.length > 0){
+      try{ localStorage.setItem('bist_sigs', JSON.stringify(S.sigs.slice(0,200))); }catch(e){}
+    }
+    // tfFilter
+    try{ localStorage.setItem('bist_tfFilter', JSON.stringify(S.tfFilter || ['D','120','240'])); }catch(e){}
+    // idxFilter
+    try{ localStorage.setItem('bist_idxFilter', JSON.stringify(S.idxFilter || 'ALL')); }catch(e){}
+    // scanIdx
+    try{ localStorage.setItem('bist_scanIdx', S.scanIdx || 'ALL'); }catch(e){}
+    // nextScanIn
+    try{ localStorage.setItem('bist_nextScanIn', String(S.nextScanIn || 0)); }catch(e){}
+    // Scan durumu
+    try{ localStorage.setItem('bist_scanRunning', _scanWasRunning || !!S.autoTimer ? '1' : '0'); }catch(e){}
+    // openPositions
+    if(typeof S.openPositions === 'object'){
+      try{ localStorage.setItem('bist_positions', JSON.stringify(S.openPositions)); }catch(e){}
+    }
+    // closedPositions
+    if(S.closedPositions && S.closedPositions.length > 0){
+      try{ localStorage.setItem('bist_closed', JSON.stringify(S.closedPositions.slice(0,500))); }catch(e){}
+    }
+    // watchlist
+    if(S.watchlist){
+      try{ localStorage.setItem('bist_wl', JSON.stringify(S.watchlist)); }catch(e){}
+    }
+    // C config
+    if(typeof C !== 'undefined'){
+      try{ localStorage.setItem('bistcfg', JSON.stringify(C)); }catch(e){}
+    }
+    // TG config
+    if(typeof TG !== 'undefined'){
+      try{ localStorage.setItem('bisttg', JSON.stringify(TG)); }catch(e){}
+    }
+    _lastScanSaveTime = Date.now();
+  }catch(e){ console.warn('saveAllState:',e.message); }
+}
+
+function _loadDeltaState(){
+  try{
+    if(typeof S === 'undefined') return;
+    // Sinyaller - kaydedilen varsa yukle
+    var savedSigs = JSON.parse(localStorage.getItem('bist_sigs') || '[]');
+    if(savedSigs.length > 0 && S.sigs.length === 0){
+      S.sigs = savedSigs;
+      try{ if(typeof renderSigs === 'function') renderSigs(); }catch(e){}
+    }
+    // tfFilter
+    var savedTf = JSON.parse(localStorage.getItem('bist_tfFilter') || 'null');
+    if(savedTf) S.tfFilter = savedTf;
+    // idxFilter
+    var savedIdx = JSON.parse(localStorage.getItem('bist_idxFilter') || 'null');
+    if(savedIdx) S.idxFilter = savedIdx;
+    // scanIdx
+    var savedScanIdx = localStorage.getItem('bist_scanIdx');
+    if(savedScanIdx) S.scanIdx = savedScanIdx;
+    // nextScanIn
+    var savedNext = parseInt(localStorage.getItem('bist_nextScanIn') || '0');
+    if(savedNext > 0) S.nextScanIn = savedNext;
+    // scanRunning
+    _scanWasRunning = localStorage.getItem('bist_scanRunning') === '1';
+    // openPositions
+    var savedPos = JSON.parse(localStorage.getItem('bist_positions') || 'null');
+    if(savedPos && Object.keys(savedPos).length > 0) S.openPositions = savedPos;
+  }catch(e){ console.warn('loadDeltaState:',e.message); }
+}
+
+//  4. ACILISTA TAM YUKLEme 
+// S.sigs acilista bos basliyor - yukle
+window.addEventListener('load', function(){
+  setTimeout(function(){
+    try{
+      if(typeof S === 'undefined') return;
+
+      // Sinyaller
+      var savedSigs = JSON.parse(localStorage.getItem('bist_sigs') || '[]');
+      if(savedSigs.length > 0 && S.sigs.length === 0){
+        S.sigs = savedSigs;
+        try{ if(typeof renderSigs === 'function') renderSigs(); }catch(e){}
+        try{ if(typeof updateBadge === 'function') updateBadge(); }catch(e){}
+        console.log('Sinyaller yuklendi: ' + savedSigs.length);
+      }
+
+      // tfFilter - checkbox'lari guncelle
+      var savedTf = JSON.parse(localStorage.getItem('bist_tfFilter') || 'null');
+      if(savedTf){
+        S.tfFilter = savedTf;
+        // UI checkbox'larini guncelle
+        ['D','120','240','W'].forEach(function(tf){
+          var el = document.getElementById('tf_'+tf);
+          if(el) el.checked = savedTf.indexOf(tf) > -1;
+        });
+      }
+
+      // idxFilter - chip'leri guncelle
+      var savedIdx = JSON.parse(localStorage.getItem('bist_idxFilter') || 'null');
+      if(savedIdx){
+        S.idxFilter = savedIdx;
+        // UI chip'lerini guncelle
+        var chips = document.querySelectorAll('#idxchips .chip');
+        chips.forEach(function(ch){
+          var v = ch.getAttribute('data-v');
+          if(Array.isArray(savedIdx)){
+            ch.classList.toggle('on', savedIdx.indexOf(v) > -1 || (savedIdx.length === 0 && v === 'ALL'));
+          } else {
+            ch.classList.toggle('on', v === savedIdx || (savedIdx === 'ALL' && v === 'ALL'));
+          }
+        });
+      }
+
+      // scanIdx
+      var savedScanIdx = localStorage.getItem('bist_scanIdx');
+      if(savedScanIdx) S.scanIdx = savedScanIdx;
+
+      // openPositions
+      var savedPos = JSON.parse(localStorage.getItem('bist_positions') || 'null');
+      if(savedPos && typeof savedPos === 'object') S.openPositions = savedPos;
+
+      // Scan timer durumu
+      var wasRunning = localStorage.getItem('bist_scanRunning') === '1';
+      _scanWasRunning = wasRunning;
+
+      console.log('PWA state yuklendi | sigs:'+S.sigs.length+' pos:'+Object.keys(S.openPositions||{}).length);
+
+    }catch(e){ console.warn('PWA load state:',e.message); }
+  }, 300);
+}, {once:true, passive:true});
+
+//  5. PERIYODIK OTOMATIK KAYIT 
+// Her 30 saniyede bir state kaydet (uygulama kapanmadan once)
+setInterval(function(){
+  try{ _saveAllState(); }catch(e){}
+}, 30000);
+
+// Scan sonrasi otomatik kayit
+var _origStartScanPWA = typeof startScan === 'function' ? startScan : null;
+setTimeout(function(){
+  try{
+    var curScan = window.startScan;
+    if(typeof curScan !== 'function') return;
+    window.startScan = function(){
+      try{ curScan(); }catch(e){}
+      // Scan basladiktan 5 sn sonra kaydet
+      setTimeout(function(){
+        try{ _saveAllState(); }catch(e){}
+      }, 5000);
+    };
+  }catch(e){}
+}, 1000);
+
+//  6. saveSets - TUM ALANLARI KAYDET 
+// Mevcut saveSets tfFilter ve idxFilter kaydetmiyor
+var _origSaveSets = typeof saveSets === 'function' ? saveSets : null;
+setTimeout(function(){
+  try{
+    var curSS = window.saveSets;
+    if(typeof curSS !== 'function') return;
+    window.saveSets = function(){
+      try{ curSS(); }catch(e){}
+      try{
+        // tfFilter - checkbox'lardan oku
+        var tf = [];
+        ['D','120','240','W'].forEach(function(t){
+          var el = document.getElementById('tf_'+t);
+          if(el && el.checked) tf.push(t);
+        });
+        if(tf.length > 0){
+          S.tfFilter = tf;
+          localStorage.setItem('bist_tfFilter', JSON.stringify(tf));
+        }
+        // idxFilter kaydet
+        localStorage.setItem('bist_idxFilter', JSON.stringify(S.idxFilter || 'ALL'));
+        localStorage.setItem('bist_scanIdx', S.scanIdx || 'ALL');
+        // C config tekrar kaydet (curSS zaten kaydediyor ama garantilemek icin)
+        if(typeof C !== 'undefined') localStorage.setItem('bistcfg', JSON.stringify(C));
+        if(typeof toast === 'function') toast('Tum ayarlar kaydedildi');
+      }catch(e){ console.warn('saveSets extra:',e.message); }
+    };
+  }catch(e){}
+}, 800);
+
+//  7. idxT - idxFilter KAYIT 
+// Her endeks seciminde localStorage'a kaydet
+var _origIdxT_PWA = typeof idxT === 'function' ? idxT : null;
+setTimeout(function(){
+  try{
+    var curIdxT = window.idxT;
+    if(typeof curIdxT !== 'function') return;
+    window.idxT = function(el){
+      try{ curIdxT(el); }catch(e){}
+      try{
+        localStorage.setItem('bist_idxFilter', JSON.stringify(S.idxFilter || 'ALL'));
+        localStorage.setItem('bist_scanIdx', S.scanIdx || 'ALL');
+      }catch(ex){}
+    };
+  }catch(e){}
+}, 900);
+
+//  8. tfFilter checkbox - her degisimde kaydet 
+window.addEventListener('load', function(){
+  setTimeout(function(){
+    try{
+      ['D','120','240','W'].forEach(function(tf){
+        var el = document.getElementById('tf_'+tf);
+        if(!el) return;
+        el.addEventListener('change', function(){
+          try{
+            var active = [];
+            ['D','120','240','W'].forEach(function(t){
+              var cb = document.getElementById('tf_'+t);
+              if(cb && cb.checked) active.push(t);
+            });
+            if(active.length > 0){
+              S.tfFilter = active;
+              localStorage.setItem('bist_tfFilter', JSON.stringify(active));
+            }
+          }catch(ex){}
+        });
+      });
+      console.log('tfFilter change listeners eklendi');
+    }catch(e){}
+  }, 1000);
+}, {once:true, passive:true});
+
+//  9. openPositions - her degisimde kaydet 
+// addPosition / closePosition sonrasi otomatik kayit
+function _hookPositionChanges(){
+  try{
+    var fns = ['addPosition','closePosition','updateStopPrice','deletePosition'];
+    fns.forEach(function(fn){
+      var orig = window[fn];
+      if(typeof orig !== 'function') return;
+      window[fn] = function(){
+        try{ orig.apply(this, arguments); }catch(e){}
+        try{
+          localStorage.setItem('bist_positions', JSON.stringify(S.openPositions || {}));
+          localStorage.setItem('bist_closed', JSON.stringify((S.closedPositions||[]).slice(0,500)));
+        }catch(ex){}
+      };
+    });
+  }catch(e){}
+}
+setTimeout(_hookPositionChanges, 1200);
+
+//  10. Watchlist - her degisimde kaydet 
+var _hookWL = function(){
+  try{
+    var fns = ['addToWL','removeFromWL','toggleWL'];
+    fns.forEach(function(fn){
+      var orig = window[fn];
+      if(typeof orig !== 'function') return;
+      window[fn] = function(){
+        try{ orig.apply(this, arguments); }catch(e){}
+        try{ localStorage.setItem('bist_wl', JSON.stringify(S.watchlist||[])); }catch(ex){}
+      };
+    });
+  }catch(e){}
+};
+setTimeout(_hookWL, 1300);
+
+//  11. PWA MANIFEST - display standalone 
+// Manifest'te display:standalone eksikse ekle
+setTimeout(function(){
+  try{
+    var manifestLink = document.querySelector('link[rel="manifest"]');
+    if(!manifestLink) return;
+    // Manifest zaten JSON string olarak olusturuluyor - guncelle
+    // Dogrudan manifest objesini window uzerinden bul
+    if(typeof _pwaManifest !== 'undefined'){
+      _pwaManifest.display = 'standalone';
+      _pwaManifest.orientation = 'portrait';
+      _pwaManifest.background_color = '#000000';
+      _pwaManifest.theme_color = '#000000';
+    }
+  }catch(e){}
+}, 500);
+
+//  LOG 
+setTimeout(function(){
+  try{
+    console.log('[BIST PWA] Blok27 hazir | Kalicilik + Zoom + Arka plan duzeltmeleri aktif');
+    if(typeof devLog === 'function'){
+      devLog('Blok27: PWA kalicilik + zoom + arka plan tarama duzeltildi', 'ok');
+    }
+  }catch(e){}
+}, 2000);
+
+})();
+
+</script>
+<script>
+
+// BIST ELITE v3 - BLOK 28: POZISYON KARTI TAM DUZELTME
+// 1. Sinyal fiyati - pozisyon objesine kalici yazilir
+// 2. Sinyal zamani - ne zaman geldi goster
+// 3. Acik pozisyon gercek PnL (fiyat cache yoksa fetch et)
+// 4. Son 10 islem - default olarak gozukur
+// 5. Kapali pozisyon karti detayli goster
+// 6. Pozisyon karti - tum bilgiler tek ekranda
+
+(function(){
+'use strict';
+
+var PROXY = typeof PROXY_URL !== 'undefined' ? PROXY_URL : 'https://bist-price-proxy.onrender.com';
+
+//  1. addPosition HOOK - signalPrice + signalTime KALICI KAYDEDILIR 
+// Sinyal gelince pozisyon eklenirken signalPrice ve signalTime kaydet
+setTimeout(function(){
+  try{
+    // Sinyalden pozisyon acma - L837 bolgesinde var
+    // Her yeni pozisyon eklendiginde signalPrice'i sig'den al
+    var origRenderSigs = window.renderSigs;
+    if(typeof origRenderSigs !== 'function') return;
+
+    // Periyodik: acik pozisyonlara sig datasini enjekte et
+    function injectSignalDataToPositions(){
+      try{
+        if(typeof S === 'undefined') return;
+        var sigs = S.sigs || [];
+        Object.keys(S.openPositions || {}).forEach(function(key){
+          var pos = S.openPositions[key];
+          if(!pos) return;
+          var parts = key.split('_');
+          var ticker = parts[0], tf = parts[1] || 'D';
+          // Bu pozisyona ait sinyali bul
+          var sig = null;
+          for(var i = 0; i < sigs.length; i++){
+            if(sigs[i].ticker === ticker && sigs[i].tf === tf && sigs[i].type !== 'stop'){
+              sig = sigs[i]; break;
+            }
+          }
+          // sigHistory'de de ara
+          if(!sig && S.sigHistory){
+            for(var j = 0; j < S.sigHistory.length; j++){
+              var h = S.sigHistory[j];
+              if(h.ticker === ticker && h.tf === tf && h.type !== 'stop'){
+                sig = h; break;
+              }
+            }
+          }
+          if(sig){
+            if(!pos.signalPrice && sig.res && sig.res.price) pos.signalPrice = sig.res.price;
+            if(!pos.signalTime){
+              var t = sig.time;
+              pos.signalTime = t instanceof Date ? t.toISOString() : (t || pos.entryTime);
+            }
+            if(!pos.signalType) pos.signalType = sig.type || 'buy';
+            if(!pos.acts && sig.res && sig.res.acts) pos.acts = sig.res.acts;
+            if(!pos.cons && sig.res) pos.cons = sig.res.cons || sig.res.consensus;
+            if(!pos.adx && sig.res) pos.adx = sig.res.adx;
+            if(!pos.pstate && sig.res) pos.pstate = sig.res.pstate;
+            if(!pos.strength && sig.res) pos.strength = sig.res.strength;
+          }
+        });
+      }catch(e){}
+    }
+
+    // renderSigs sonrasi enjekte et
+    window.renderSigs = function(){
+      try{ origRenderSigs(); }catch(e){}
+      setTimeout(injectSignalDataToPositions, 300);
+    };
+
+    // Sayfa yuklenince de enjekte et
+    setTimeout(injectSignalDataToPositions, 2000);
+    // Her 5 dakikada bir
+    setInterval(injectSignalDataToPositions, 300000);
+
+  }catch(e){ console.warn('signalData inject:',e.message); }
+}, 500);
+
+//  2. GERCEk PNL - FIYAT CACHE YOKSA FETCH 
+function fetchMissingPrices(){
+  try{
+    if(typeof S === 'undefined') return;
+    var missing = [];
+    Object.keys(S.openPositions || {}).forEach(function(key){
+      var ticker = key.split('_')[0];
+      var cached = S.priceCache && S.priceCache[ticker];
+      if(!cached || !cached.price || Date.now() - (cached._ts || 0) > 5 * 60000){
+        if(missing.indexOf(ticker) === -1) missing.push(ticker);
+      }
+    });
+    if(!missing.length) return;
+
+    fetch(PROXY + '/prices?symbols=' + missing.join(','))
+      .then(function(r){ return r.json(); })
+      .then(function(data){
+        if(!data || !data.prices) return;
+        if(!S.priceCache) S.priceCache = {};
+        data.prices.forEach(function(p){
+          S.priceCache[p.ticker] = {
+            price: p.price, pct: p.change_pct, _ts: Date.now()
+          };
+        });
+        // Fiyat geldi - pozisyonlari yenile
+        try{ if(typeof renderPositions === 'function') renderPositions(); }catch(e){}
+      }).catch(function(){});
+  }catch(e){}
+}
+
+//  3. renderPositions TAM OVERRIDE 
+// Tum eksik bilgileri gosteren kapsamli pozisyon karti
+setTimeout(function(){
+  try{
+    window.renderPositions = function(){
+      try{
+        if(typeof S === 'undefined') return;
+        var positions = Object.keys(S.openPositions || {});
+        var badge = document.getElementById('posBadge');
+        if(badge){ badge.textContent = positions.length; badge.style.display = positions.length ? 'inline-flex' : 'none'; }
+
+        var posListEl = document.getElementById('positionList');
+        var countEl = document.getElementById('posCount');
+        var totalEl = document.getElementById('posTotalPnl');
+        var bestEl = document.getElementById('posBestPnl');
+        var worstEl = document.getElementById('posWorstPnl');
+
+        if(!positions.length){
+          if(posListEl) posListEl.innerHTML = '<div class="empty"><div class="eico">&#128188;</div><div style="font-size:11px">Sinyal geldiginde otomatik pozisyon acar</div></div>';
+          if(countEl) countEl.textContent = '0';
+          if(totalEl) totalEl.textContent = '-';
+          if(bestEl) bestEl.textContent = '-';
+          if(worstEl) worstEl.textContent = '-';
+          return;
+        }
+
+        // Eksik fiyatlari getir
+        fetchMissingPrices();
+
+        var totalPnl = 0, bestPnl = -999, worstPnl = 999;
+        var bestTicker = '', worstTicker = '';
+        var cards = '';
+
+        positions.forEach(function(key){
+          var pos = S.openPositions[key];
+          if(!pos) return;
+          var parts = key.split('_'), ticker = parts[0], tf = parts[1] || 'D';
+          var tfL = tf==='D'?'Gunluk':tf==='240'?'4 Saat':'2 Saat';
+          var cached = S.priceCache && S.priceCache[ticker];
+          var curPrice = cached && cached.price > 0 ? cached.price : null;
+          var isReal = !!curPrice;
+          if(!curPrice) curPrice = pos.entry; // Fiyat yoksa entry goster ama 0 PnL
+
+          // En yuksek guncelle
+          if(curPrice > (pos.highest || 0)) pos.highest = curPrice;
+
+          // PnL
+          var pnlPct = isReal ? ((curPrice - pos.entry) / pos.entry * 100) : 0;
+          var pnlStr = isReal ? ((pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%') : '...';
+          var isProfit = pnlPct >= 0;
+          if(isReal){ totalPnl += pnlPct; if(pnlPct > bestPnl){bestPnl=pnlPct;bestTicker=ticker;} if(pnlPct < worstPnl){worstPnl=pnlPct;worstTicker=ticker;} }
+
+          // Sure hesapla
+          var holdMs = Date.now() - new Date(pos.entryTime || Date.now()).getTime();
+          var holdDays = Math.floor(holdMs / 86400000);
+          var holdStr = holdDays === 0 ? 'Bugun' : holdDays + 'g';
+
+          // Sinyal zamani
+          var sigTime = pos.signalTime || pos.entryTime;
+          var sigTimeStr = '';
+          if(sigTime){
+            var st = new Date(sigTime);
+            sigTimeStr = st.getDate()+'.'+(st.getMonth()+1)+'.'+st.getFullYear()
+              +' '+String(st.getHours()).padStart(2,'0')+':'+String(st.getMinutes()).padStart(2,'0');
+          }
+
+          // Trailing stop
+          var atr = pos.entry * 0.022 * ((typeof C !== 'undefined' && C.atrm) || 8) / 10;
+          pos.stopPrice = (pos.highest || pos.entry) - atr;
+
+          // Gun degisimi
+          var dayChg = cached ? cached.pct : null;
+
+          // Sinyal fiyati
+          var sigPrice = pos.signalPrice || pos.entry;
+
+          cards += '<div class="pos-card ' + (isReal ? (isProfit ? 'profit' : 'loss') : '') + '" style="margin-bottom:10px;border-radius:12px;overflow:hidden;border:1px solid ' + (isProfit ? 'rgba(0,230,118,.2)' : 'rgba(255,68,68,.15)') + ';background:rgba(255,255,255,.03)">'
+
+            // Header: ticker + PnL
+            + '<div style="display:flex;align-items:center;justify-content:space-between;padding:11px 13px;background:rgba(255,255,255,.02)">'
+              + '<div>'
+                + '<div style="font-size:16px;font-weight:800;color:var(--t1);letter-spacing:.3px">'
+                  + ticker
+                  + (isReal ? '<span style="font-size:8px;color:var(--green);margin-left:5px;background:rgba(0,230,118,.1);padding:1px 5px;border-radius:4px">CANLI</span>' : '<span style="font-size:8px;color:var(--t4);margin-left:5px">fiyat bekleniyor</span>')
+                + '</div>'
+                + '<div style="font-size:9px;color:var(--t4);margin-top:2px">' + tfL + '  ' + holdStr + (sigTimeStr ? '  <span style="color:rgba(0,212,255,.6)">' + sigTimeStr + '</span>' : '') + '</div>'
+              + '</div>'
+              + '<div style="text-align:right">'
+                + '<div style="font-size:22px;font-weight:800;color:' + (isReal ? (isProfit ? 'var(--green)' : 'var(--red)') : 'var(--t4)') + ';font-family:Courier New,monospace">' + pnlStr + '</div>'
+                + '<div style="font-size:13px;font-weight:700;color:var(--t1);font-family:Courier New,monospace">TL' + curPrice.toFixed(2) + '</div>'
+                + (dayChg != null ? '<div style="font-size:9px;color:' + (dayChg >= 0 ? 'var(--green)' : 'var(--red)') + '">' + (dayChg >= 0 ? '+' : '') + dayChg.toFixed(2) + '% bugun</div>' : '')
+              + '</div>'
+            + '</div>'
+
+            // Grid: sinyal, giris, en yuksek, stop
+            + '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:rgba(255,255,255,.04)">'
+              + _posCell('TL' + sigPrice.toFixed(2), 'Sinyal Fiyati', 'var(--cyan)')
+              + _posCell('TL' + pos.entry.toFixed(2), 'Giris')
+              + _posCell('TL' + (pos.highest || pos.entry).toFixed(2), 'En Yuksek', 'var(--green)')
+              + _posCell('TL' + (pos.stopPrice || 0).toFixed(2), 'Trailing Stop', 'var(--orange)')
+            + '</div>'
+
+            // Sinyal detaylari
+            + (pos.cons || pos.adx || pos.pstate || pos.acts
+              ? '<div style="display:flex;gap:6px;padding:7px 12px;flex-wrap:wrap;background:rgba(255,255,255,.02)">'
+                + (pos.cons ? '<span style="font-size:8.5px;background:rgba(0,212,255,.1);color:var(--cyan);padding:2px 8px;border-radius:5px">Kons: %' + (parseFloat(pos.cons)||0).toFixed(0) + '</span>' : '')
+                + (pos.adx ? '<span style="font-size:8.5px;background:rgba(255,255,255,.06);color:var(--t3);padding:2px 8px;border-radius:5px">ADX: ' + pos.adx + '</span>' : '')
+                + (pos.pstate ? '<span style="font-size:8.5px;background:rgba(255,255,255,.04);color:var(--t4);padding:2px 8px;border-radius:5px">' + pos.pstate + '</span>' : '')
+                + (pos.strength ? '<span style="font-size:8.5px;background:rgba(255,184,0,.1);color:var(--gold);padding:2px 8px;border-radius:5px">Guc: ' + pos.strength + '/10</span>' : '')
+                + (pos.acts && pos.acts.length ? '<span style="font-size:8px;color:var(--t4);padding:2px">' + pos.acts.slice(0,3).join('  ') + '</span>' : '')
+              + '</div>'
+              : '')
+
+            // Butonlar
+            + '<div style="display:flex;gap:6px;padding:9px 12px">'
+              + '<button onclick="openStockDashboard(\'' + ticker + '\')" style="flex:1;padding:8px;border-radius:8px;background:rgba(0,212,255,.08);border:1px solid rgba(0,212,255,.2);color:var(--cyan);font-size:10px;font-weight:700;cursor:pointer">Grafik / AI</button>'
+              + '<button onclick="openPositionSizer(\'' + ticker + '\',' + curPrice.toFixed(2) + ',' + (pos.stopPrice||0).toFixed(2) + ')" style="padding:8px 10px;border-radius:8px;background:rgba(255,184,0,.08);border:1px solid rgba(255,184,0,.2);color:var(--gold);font-size:10px;cursor:pointer">Lot</button>'
+              + '<button onclick="closePosition(\'' + key + '\')" style="padding:8px 10px;border-radius:8px;background:rgba(255,68,68,.08);border:1px solid rgba(255,68,68,.2);color:var(--red);font-size:10px;cursor:pointer">Kapat</button>'
+            + '</div>'
+
+          + '</div>';
+        });
+
+        if(posListEl) posListEl.innerHTML = cards || '<div class="empty">Pozisyon yok</div>';
+        if(countEl) countEl.textContent = positions.length;
+        if(totalEl){ totalEl.textContent = (totalPnl >= 0 ? '+' : '') + totalPnl.toFixed(2) + '%'; totalEl.className = 'sval ' + (totalPnl >= 0 ? 'p' : 'n'); }
+        if(bestEl) bestEl.textContent = bestTicker ? bestTicker + ' +' + bestPnl.toFixed(1) + '%' : '-';
+        if(worstEl) worstEl.textContent = worstTicker ? worstTicker + ' ' + worstPnl.toFixed(1) + '%' : '-';
+
+      }catch(e){ console.warn('renderPositions v28:',e.message); }
+    };
+
+    function _posCell(val, lbl, color){
+      return '<div style="padding:9px 10px;background:rgba(0,0,0,.2)">'
+        + '<div style="font-size:11px;font-weight:700;color:' + (color||'var(--t1)') + ';font-family:Courier New,monospace">' + val + '</div>'
+        + '<div style="font-size:8px;color:var(--t4);margin-top:2px">' + lbl + '</div>'
+        + '</div>';
+    }
+    window._posCell = _posCell;
+
+  }catch(e){ console.warn('renderPositions override:',e.message); }
+}, 600);
+
+//  4. renderClosedPositions - SON 10 ISLEM DEFAULT GORUNUR 
+setTimeout(function(){
+  try{
+    // posTab('closed') - varsayilan olarak her sayfa yenilemede goster
+    var origPosTab = typeof posTab === 'function' ? posTab : null;
+
+    // Kapali pozisyon varsa tab'i default goster
+    window.addEventListener('load', function(){
+      setTimeout(function(){
+        try{
+          // Sayfa acilinca closed tab da hazir olsun (gizli de olsa)
+          if(typeof renderClosedPositions === 'function') renderClosedPositions();
+        }catch(e){}
+      }, 2000);
+    }, {once:true, passive:true});
+
+    // renderClosedPositions gelismis kart
+    var origRCP = typeof renderClosedPositions === 'function' ? renderClosedPositions : null;
+
+    window.renderClosedPositions = function(){
+      try{
+        var el = document.getElementById('closedList');
+        if(!el) return;
+        var closed = S.closedPositions || [];
+
+        if(!closed.length){
+          el.innerHTML = '<div class="empty"><div class="eico">&#128218;</div><div style="font-size:11px">Kapanmis pozisyon yok</div></div>';
+          return;
+        }
+
+        // Ozet istatistikler
+        var totalPnl = 0, wins = 0;
+        closed.forEach(function(p){ var pnl = parseFloat(p.pnlPct||0); totalPnl += pnl; if(pnl >= 0) wins++; });
+        var wr = (wins / closed.length * 100).toFixed(1);
+        var avgPnl = (totalPnl / closed.length).toFixed(2);
+
+        var html = '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:10px">'
+          + '<div class="sstat"><div class="sval ' + (parseFloat(avgPnl)>=0?'p':'n') + '">' + (avgPnl>=0?'+':'') + avgPnl + '%</div><div class="slb2">Ort. PnL</div></div>'
+          + '<div class="sstat"><div class="sval" style="color:' + (parseFloat(wr)>=50?'var(--green)':'var(--red)') + '">%' + wr + '</div><div class="slb2">Win Rate</div></div>'
+          + '<div class="sstat"><div class="sval">' + closed.length + '</div><div class="slb2">Toplam</div></div>'
+          + '</div>';
+
+        // Son 20 islem karti
+        html += '<div style="font-size:9px;font-weight:700;color:var(--t4);text-transform:uppercase;letter-spacing:2px;margin-bottom:7px">Son ' + Math.min(20, closed.length) + ' Islem</div>';
+
+        closed.slice(0, 20).forEach(function(p){
+          var pnl = parseFloat(p.pnlPct || 0);
+          var isProfit = pnl >= 0;
+          var pnlStr = (isProfit ? '+' : '') + pnl.toFixed(2) + '%';
+
+          // Tarih formatla
+          var entryD = p.entryTime ? new Date(p.entryTime) : null;
+          var exitD  = p.exitTime  ? new Date(p.exitTime)  : null;
+          var dateStr = '';
+          if(entryD && exitD){
+            var fmt = function(d){ return d.getDate()+'.'+(d.getMonth()+1)+'.'+d.getFullYear(); };
+            dateStr = fmt(entryD) + ' - ' + fmt(exitD);
+          }
+
+          var tfL = p.tf==='D'?'G':p.tf==='240'?'4S':'2S';
+
+          html += '<div style="padding:10px 12px;border-radius:10px;border:1px solid '
+            + (isProfit?'rgba(0,230,118,.15)':'rgba(255,68,68,.12)')
+            + ';background:rgba(255,255,255,.02);margin-bottom:6px">'
+
+            + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
+              + '<div style="font-size:13px;font-weight:800;color:var(--t1)">' + p.ticker + '</div>'
+              + '<div style="font-size:8px;color:var(--t4)">' + tfL + '</div>'
+              + (dateStr ? '<div style="font-size:8px;color:var(--t4);margin-left:auto">' + dateStr + '</div>' : '')
+              + '<div style="font-size:16px;font-weight:800;color:' + (isProfit?'var(--green)':'var(--red)') + ';font-family:Courier New,monospace;margin-left:auto">' + pnlStr + '</div>'
+            + '</div>'
+
+            + '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:rgba(255,255,255,.04);border-radius:7px;overflow:hidden">'
+              + _miniCell('TL'+(p.entry||0).toFixed(2),'Giris')
+              + _miniCell('TL'+(p.exit||0).toFixed(2),'Cikis')
+              + _miniCell((p.holdDays||0)+'g','Sure')
+              + _miniCell((p.pstate||'-'),'Bolge')
+            + '</div>'
+
+            + (p.acts && p.acts.length
+              ? '<div style="margin-top:5px;display:flex;gap:4px;flex-wrap:wrap">'
+                + p.acts.slice(0,4).map(function(a){
+                    return '<span style="font-size:7.5px;padding:1px 6px;border-radius:4px;background:rgba(0,212,255,.08);color:var(--cyan)">' + a + '</span>';
+                  }).join('')
+              + '</div>'
+              : '')
+
+          + '</div>';
+        });
+
+        el.innerHTML = html;
+
+        function _miniCell(val, lbl){
+          return '<div style="padding:6px 8px;background:rgba(0,0,0,.2)">'
+            + '<div style="font-size:10px;font-weight:700;color:var(--t1);font-family:Courier New,monospace">' + val + '</div>'
+            + '<div style="font-size:7.5px;color:var(--t4);margin-top:1px">' + lbl + '</div>'
+            + '</div>';
+        }
+
+      }catch(e){ console.warn('renderClosedPositions v28:',e.message); }
+    };
+
+  }catch(e){ console.warn('closedPositions override:',e.message); }
+}, 700);
+
+//  5. POZISYON SAYFASINDA KAPALI TAB DEFAULT GOSTER 
+// Sayfa acilinca son 10 islem de hazir olsun - alinacak tab'e gore
+var _origPg2 = window.pg;
+setTimeout(function(){
+  try{
+    var curPg = window.pg;
+    window.pg = function(name){
+      try{ curPg(name); }catch(e){}
+      if(name === 'positions'){
+        setTimeout(function(){
+          try{
+            if(typeof renderClosedPositions === 'function') renderClosedPositions();
+          }catch(e){}
+        }, 200);
+      }
+    };
+  }catch(e){}
+}, 800);
+
+//  6. FIYAT GUNCELLEMEDE ANINDA RENDER 
+// Her fiyat guncellenmesinde pozisyon kartini yenile
+setTimeout(function(){
+  try{
+    var origFetchPrices = typeof b4FetchPrices === 'function' ? b4FetchPrices : null;
+    if(origFetchPrices){
+      window.b4FetchPrices = function(){
+        try{ origFetchPrices(); }catch(e){}
+        setTimeout(function(){
+          try{
+            var posPage = document.getElementById('page-positions');
+            if(posPage && posPage.classList.contains('on')){
+              if(typeof renderPositions === 'function') renderPositions();
+            }
+          }catch(e){}
+        }, 1500);
+      };
+    }
+  }catch(e){}
+}, 900);
+
+//  LOG 
+setTimeout(function(){
+  try{
+    console.log('[BIST v28] Pozisyon karti: signalPrice, signalTime, PnL, gecmis islemler aktif');
+    if(typeof devLog === 'function') devLog('Blok28: Pozisyon karti tam duzeltildi', 'ok');
+  }catch(e){}
+}, 2500);
+
+})();
+
+</script>
+<script>
+
+// BIST ELITE v3 - BLOK 29: DASHBOARD TAM DUZELTME
+// 1. stockDashboard tam ekran - iOS safe area, z-index fix
+// 2. LWC CDN timeout + fallback + inline mini chart alternatif
+// 3. OHLCV data/ohlcv field uyumsuzlugu fix
+// 4. Grafik loading - LWC hazir olmadan render etme
+// 5. Dashboard ekrandan sigmiyor sorunu
+
+(function(){
+'use strict';
+
+//  1. DASHBOARD CSS - iOS SAFE AREA + TAM EKRAN 
+(function(){
+  try{
+    var st = document.createElement('style');
+    st.textContent =
+      // Tam ekran - iOS notch ve home indicator dahil
+      '#stockDashboard{'
+      +'  position: fixed !important;'
+      +'  top: 0 !important; left: 0 !important;'
+      +'  right: 0 !important; bottom: 0 !important;'
+      +'  width: 100% !important; height: 100% !important;'
+      +'  max-width: 100% !important; max-height: 100% !important;'
+      +'  background: #000 !important;'
+      +'  z-index: 10010 !important;'  /* En ustte - her seyin uzerinde */
+      +'  display: none;'
+      +'  flex-direction: column;'
+      +'  overflow: hidden;'
+      // iOS safe area
+      +'  padding-top: env(safe-area-inset-top);'
+      +'  padding-bottom: env(safe-area-inset-bottom);'
+      +'  padding-left: env(safe-area-inset-left);'
+      +'  padding-right: env(safe-area-inset-right);'
+      +'}'
+      +'#stockDashboard.on{ display: flex !important; }'
+      // Header - fixed height
+      +'.sdh{'
+      +'  height: 52px; min-height: 52px; flex-shrink: 0;'
+      +'  background: rgba(5,5,15,.98) !important;'
+      +'}'
+      // Tab bar - fixed height
+      +'.sdtabs{'
+      +'  flex-shrink: 0;'
+      +'  background: rgba(0,0,0,.8) !important;'
+      +'  -webkit-overflow-scrolling: touch;'
+      +'  overflow-x: auto; overflow-y: hidden;'
+      +'  scrollbar-width: none;'
+      +'}'
+      +'.sdtabs::-webkit-scrollbar{ display: none; }'
+      // Content - kalani doldur
+      +'.sdcontent{'
+      +'  flex: 1 !important;'
+      +'  overflow-y: auto !important;'
+      +'  overflow-x: hidden;'
+      +'  -webkit-overflow-scrolling: touch;'
+      +'  padding: 10px;'
+      +'  min-height: 0;'  /* flex child overflow fix */
+      +'}'
+      // Chart container - responsive height
+      +'#sdChartWrap{'
+      +'  width: 100% !important;'
+      +'  height: 260px !important;'
+      +'  background: #000;'
+      +'  border-radius: 10px;'
+      +'  overflow: hidden;'
+      +'  margin-bottom: 8px;'
+      +'}'
+      +'#sdChart{ width: 100% !important; height: 190px !important; }'
+      +'#sdRSI{ width: 100% !important; height: 70px !important; }'
+      // Back button touch area buyut
+      +'.sdh-back{'
+      +'  min-width: 44px; min-height: 44px;'
+      +'  display: flex; align-items: center; justify-content: center;'
+      +'}'
+      // Tab - min touch area
+      +'.sdtab{ min-height: 44px; padding: 0 14px; }'
+    ;
+    document.head.appendChild(st);
+  }catch(e){}
+})();
+
+//  2. LWC - INLINE FALLBACK + CDN FIX 
+// CDN yuklenemiyorsa basit Canvas chart kullan
+var _lwcFailed = false;
+var _lwcTimeout = null;
+
+// loadLWC'yi override et - timeout ekle
+var _origLoadLWC = typeof loadLWC === 'function' ? loadLWC : null;
+window.loadLWC = function(cb){
+  // Zaten yuklu
+  if(window._lwcLoaded && window.LightweightCharts){ cb(); return; }
+
+  // 8 sn timeout - CDN gelmezse canvas chart kullan
+  _lwcTimeout = setTimeout(function(){
+    if(!window.LightweightCharts){
+      console.warn('LWC CDN timeout - Canvas chart kullanilacak');
+      _lwcFailed = true;
+      window._lwcLoaded = true; // fake loaded
+      if(cb) try{ cb(); }catch(e){}
+    }
+  }, 8000);
+
+  // CDN'leri paralel yukle
+  var sources = [
+    'https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js',
+    'https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/lightweight-charts/4.2.0/lightweight-charts.standalone.production.js'
+  ];
+
+  var loaded = false;
+  function tryLoad(idx){
+    if(loaded || idx >= sources.length) return;
+    var s = document.createElement('script');
+    s.src = sources[idx];
+    s.onload = function(){
+      if(loaded) return;
+      loaded = true;
+      clearTimeout(_lwcTimeout);
+      window._lwcLoaded = true;
+      _lwcFailed = false;
+      if(cb) try{ cb(); }catch(e){}
+    };
+    s.onerror = function(){
+      setTimeout(function(){ tryLoad(idx + 1); }, 500);
+    };
+    document.head.appendChild(s);
+    // 3 sn sonra bir sonraki kaynagi dene (paralel)
+    if(idx === 0) setTimeout(function(){ tryLoad(1); }, 3000);
+  }
+  tryLoad(0);
+};
+
+//  3. OHLCV FIELD UYUMSUZLUGU FIX 
+// Proxy "data" field donduruyor, frontend "ohlcv" field bekliyor
+// fetchDashboardData override - her iki field'i da destekle
+var _origFDD = typeof fetchDashboardData === 'function' ? fetchDashboardData : null;
+window.fetchDashboardData = function(ticker, tf){
+  try{
+    _sd.loading = true;
+    var el = document.getElementById('sdContent');
+    if(el) el.innerHTML = '<div class="sd-loading"><div class="sd-spin"></div>'
+      +'<span style="font-size:11px;color:var(--t4)">'+ticker+' verisi yukleniyor...</span></div>';
+
+    var PROXY2 = typeof PROXY_URL !== 'undefined' ? PROXY_URL : 'https://bist-price-proxy.onrender.com';
+
+    Promise.all([
+      fetch(PROXY2+'/ohlcv/'+ticker+'?tf='+(tf||'D'))
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          // Field normalize: data veya ohlcv - ikisini de destekle
+          if(d && !d.ohlcv && d.data) d.ohlcv = d.data;
+          return d;
+        })
+        .catch(function(){ return null; }),
+      fetch(PROXY2+'/analyze/'+ticker+'?tf='+(tf||'D'))
+        .then(function(r){ return r.json(); })
+        .catch(function(){ return null; }),
+    ]).then(function(results){
+      _sd.ohlcv = results[0];
+      _sd.analysis = results[1];
+      _sd.loading = false;
+
+      // Fiyat guncelle
+      if(_sd.analysis && _sd.analysis.price){
+        var pEl = document.getElementById('sdPrice');
+        if(pEl) pEl.textContent = 'TL' + _sd.analysis.price.toFixed(2);
+      }
+
+      // OHLCV debug
+      var ohlcvArr = _sd.ohlcv && (_sd.ohlcv.ohlcv || _sd.ohlcv.data);
+      console.log('[Dashboard] '+ticker+' OHLCV: '+(ohlcvArr?ohlcvArr.length+' bar':'YOK'));
+
+      switchSDTab(_sd.activeTab, true);
+    }).catch(function(e){
+      _sd.loading = false;
+      if(el) el.innerHTML = '<div style="padding:20px;text-align:center;color:var(--red);font-size:11px">'
+        +'Veri yuklenemedi: '+e.message+'<br><button onclick="fetchDashboardData(\''+ticker+'\',\''+tf+'\')" '
+        +'style="margin-top:8px;padding:8px 16px;border-radius:8px;background:rgba(0,212,255,.1);'
+        +'border:1px solid rgba(0,212,255,.2);color:var(--cyan);font-size:10px;cursor:pointer">Tekrar Dene</button></div>';
+    });
+  }catch(e){
+    _sd.loading = false;
+    console.warn('fetchDashboardData:',e.message);
+  }
+};
+
+//  4. renderSDChart - OHLCV FIELD + CANVAS FALLBACK 
+var _origRenderSDChart = typeof renderSDChart === 'function' ? renderSDChart : null;
+window.renderSDChart = function(){
+  try{
+    var el = document.getElementById('sdContent');
+    if(!el) return;
+
+    // OHLCV - her iki field'i dene
+    var ohlcvData = _sd.ohlcv && (_sd.ohlcv.ohlcv || _sd.ohlcv.data);
+
+    if(!ohlcvData || !ohlcvData.length){
+      el.innerHTML = '<div style="padding:30px;text-align:center">'
+        +'<div style="font-size:30px;margin-bottom:10px"></div>'
+        +'<div style="font-size:12px;color:var(--t2);margin-bottom:6px">Grafik verisi yok</div>'
+        +'<div style="font-size:10px;color:var(--t4);margin-bottom:14px">Piyasa kapali olabilir veya proxy baglantisi yok</div>'
+        +'<button onclick="fetchDashboardData(\''+_sd.ticker+'\',\''+_sd.tf+'\')" '
+        +'style="padding:10px 20px;border-radius:9px;background:rgba(0,212,255,.1);'
+        +'border:1px solid rgba(0,212,255,.25);color:var(--cyan);font-size:11px;cursor:pointer">Tekrar Yukle</button>'
+        // Analysis bilgilerini yine de goster
+        + (_sd.analysis ? renderSDMetricsHTML() : '')
+        +'</div>';
+      return;
+    }
+
+    // LWC yuklenmemisse Canvas chart kullan
+    if(_lwcFailed || !window.LightweightCharts){
+      renderCanvasChart(ohlcvData, el);
+      return;
+    }
+
+    // LWC yuklu - original render
+    // Ama once _sd.ohlcv.ohlcv'yi garantile
+    if(!_sd.ohlcv.ohlcv && _sd.ohlcv.data) _sd.ohlcv.ohlcv = _sd.ohlcv.data;
+
+    // TF butonlari + indicator butonlari
+    el.innerHTML =
+      '<div class="chart-tf-btns">'
+      +['D','240','120','W'].map(function(tf){
+        var lbl = {D:'1G','240':'4S','120':'2S',W:'1H'}[tf]||tf;
+        return '<button class="chart-tf-btn'+(tf===_sd.tf?' active':'')+'" onclick="changeDashboardTF(\''+tf+'\')">'+lbl+'</button>';
+      }).join('')+'</div>'
+      +'<div class="chart-ind-btns">'
+      +[['ema50','EMA50'],['ema200','EMA200'],['bb','Bollinger'],['volume','Hacim']].map(function(p){
+        return '<button class="chart-ind-btn'+((_sd.indicators&&_sd.indicators[p[0]])?' active':'')+'" onclick="toggleDashboardInd(\''+p[0]+'\')">'+p[1]+'</button>';
+      }).join('')+'</div>'
+      +'<div id="sdChartWrap"><div id="sdChart"></div></div>'
+      +'<div class="sd-section"><div class="sd-section-title">RSI(14)</div>'
+      +'<div id="sdRSI" style="height:70px;background:#000;border-radius:8px"></div></div>'
+      + renderSDMetricsHTML()
+    ;
+
+    // LWC hazir mi?
+    if(window.LightweightCharts){
+      setTimeout(function(){ try{ buildLWChart(ohlcvData); }catch(e){ console.warn('LWC:',e.message); } }, 50);
+    } else {
+      loadLWC(function(){
+        setTimeout(function(){ try{ buildLWChart(ohlcvData); }catch(e){ renderCanvasChart(ohlcvData, el); } }, 50);
+      });
+    }
+  }catch(e){ console.warn('renderSDChart:',e.message); }
+};
+
+//  5. CANVAS CHART FALLBACK (LWC olmadan) 
+function renderCanvasChart(ohlcv, container){
+  try{
+    if(!container) container = document.getElementById('sdContent');
+    if(!container) return;
+
+    // Onceki content koru, sadece chart'i degistir
+    var chartArea = container.querySelector('#sdChartWrap');
+    if(!chartArea){
+      // Yeni div olustur
+      container.innerHTML =
+        '<div class="chart-tf-btns">'
+        +['D','240','120'].map(function(tf){
+          var lbl={D:'1G','240':'4S','120':'2S'}[tf];
+          return '<button class="chart-tf-btn'+(tf===_sd.tf?' active':'')+'" onclick="changeDashboardTF(\''+tf+'\')">'+lbl+'</button>';
+        }).join('')+'</div>'
+        +'<div id="sdChartWrap" style="position:relative"><canvas id="sdChartCanvas" style="width:100%;height:250px;display:block"></canvas>'
+        +'<div id="sdChartInfo" style="position:absolute;top:6px;right:8px;font-size:9px;color:rgba(255,255,255,.4)">Canvas Mode</div>'
+        +'</div>'
+        + renderSDMetricsHTML();
+      chartArea = container.querySelector('#sdChartWrap');
+    }
+
+    var canvas = container.querySelector('#sdChartCanvas');
+    if(!canvas) return;
+
+    var W = canvas.offsetWidth || 340;
+    var H = 250;
+    canvas.width = W * (window.devicePixelRatio||1);
+    canvas.height = H * (window.devicePixelRatio||1);
+    canvas.style.width = W+'px';
+    canvas.style.height = H+'px';
+    var ctx = canvas.getContext('2d');
+    var dpr = window.devicePixelRatio||1;
+    ctx.scale(dpr, dpr);
+
+    // Son 60 bar
+    var bars = ohlcv.slice(-60);
+    if(!bars.length) return;
+
+    var pad = {top:10, right:50, bottom:20, left:10};
+    var cw = W - pad.left - pad.right;
+    var ch = H - pad.top - pad.bottom;
+
+    // Min/Max
+    var highs = bars.map(function(b){return b.h||b.high||b.c||0;});
+    var lows  = bars.map(function(b){return b.l||b.low||b.c||0;});
+    var minP = Math.min.apply(null, lows);
+    var maxP = Math.max.apply(null, highs);
+    var range = maxP - minP || 1;
+
+    var barW = Math.max(1, Math.floor(cw / bars.length) - 1);
+
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+
+    // Grid lines
+    ctx.strokeStyle = 'rgba(255,255,255,.05)';
+    ctx.lineWidth = 0.5;
+    for(var g=0;g<4;g++){
+      var gy = pad.top + ch/3*g;
+      ctx.beginPath(); ctx.moveTo(pad.left,gy); ctx.lineTo(W-pad.right,gy); ctx.stroke();
+    }
+
+    // Mum grafigi
+    bars.forEach(function(bar, i){
+      var x = pad.left + i * (cw/bars.length);
+      var o = bar.o||bar.open||bar.c||0;
+      var h = bar.h||bar.high||bar.c||0;
+      var l = bar.l||bar.low||bar.c||0;
+      var cl= bar.c||bar.close||0;
+      var isUp = cl >= o;
+      var color = isUp ? '#00E676' : '#FF4444';
+
+      // Wick
+      var highY = pad.top + ch * (1-(h-minP)/range);
+      var lowY  = pad.top + ch * (1-(l-minP)/range);
+      var openY = pad.top + ch * (1-(o-minP)/range);
+      var closeY= pad.top + ch * (1-(cl-minP)/range);
+
+      ctx.strokeStyle = color; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x + barW/2, highY);
+      ctx.lineTo(x + barW/2, lowY);
+      ctx.stroke();
+
+      // Body
+      ctx.fillStyle = color;
+      var bodyTop = Math.min(openY, closeY);
+      var bodyH   = Math.max(1, Math.abs(closeY - openY));
+      ctx.fillRect(x, bodyTop, Math.max(2, barW), bodyH);
+    });
+
+    // Son fiyat line
+    if(bars.length){
+      var lastClose = bars[bars.length-1].c||bars[bars.length-1].close||0;
+      var lastY = pad.top + ch * (1-(lastClose-minP)/range);
+      ctx.strokeStyle = 'rgba(0,212,255,.6)'; ctx.lineWidth = 1; ctx.setLineDash([4,4]);
+      ctx.beginPath(); ctx.moveTo(pad.left,lastY); ctx.lineTo(W-pad.right,lastY); ctx.stroke();
+      ctx.setLineDash([]);
+      // Fiyat etiketi
+      ctx.fillStyle = 'rgba(0,0,0,.8)'; ctx.fillRect(W-pad.right+2, lastY-9, pad.right-2, 18);
+      ctx.fillStyle = 'var(--cyan)' || '#00D4FF'; ctx.font = '9px Courier New'; ctx.textAlign='left';
+      ctx.fillText(lastClose.toFixed(2), W-pad.right+4, lastY+4);
+    }
+
+    // Fiyat ekseni
+    ctx.fillStyle = 'rgba(255,255,255,.4)'; ctx.font = '8px Arial'; ctx.textAlign='right';
+    [0,0.5,1].forEach(function(r){
+      var price = minP + range * (1-r);
+      var py = pad.top + ch * r;
+      ctx.fillText(price.toFixed(2), W-2, py+4);
+    });
+
+  }catch(e){ console.warn('canvasChart:',e.message); }
+}
+window.renderCanvasChart = renderCanvasChart;
+
+//  6. openStockDashboard - Z-INDEX FIX 
+var _origOSD = typeof openStockDashboard === 'function' ? openStockDashboard : null;
+window.openStockDashboard = function(ticker, name){
+  try{
+    if(!ticker) return;
+    _sd.ticker = ticker;
+    _sd.name = name || ticker;
+    _sd.activeTab = 'chart';
+    _sd.tf = 'D';
+    _sd.loading = false;
+
+    var modal = document.getElementById('stockDashboard');
+    if(!modal){ 
+      if(typeof createDashboardModal === 'function') createDashboardModal();
+      modal = document.getElementById('stockDashboard');
+    }
+    if(!modal) return;
+
+    // Z-index en uste al
+    modal.style.zIndex = '10010';
+    modal.classList.add('on');
+
+    // Body scroll engelle
+    document.body.style.overflow = 'hidden';
+    document.body.style.position = 'fixed';
+    document.body.style.width = '100%';
+
+    if(typeof updateDashboardHeader === 'function') updateDashboardHeader(ticker, name);
+
+    // LWC hazirsa direkt yukle, degilse paralel baslat
+    if(window.LightweightCharts){
+      if(typeof switchSDTab === 'function') switchSDTab('chart');
+      fetchDashboardData(ticker, 'D');
+    } else {
+      // Once veriyi getir, LWC paralel yukle
+      loadLWC(function(){});
+      if(typeof switchSDTab === 'function') switchSDTab('chart');
+      fetchDashboardData(ticker, 'D');
+    }
+
+    if(typeof haptic === 'function') haptic('medium');
+  }catch(e){ console.warn('openStockDashboard:',e.message); }
+};
+
+// closeStockDashboard - body reset
+var _origCSD = typeof closeStockDashboard === 'function' ? closeStockDashboard : null;
+window.closeStockDashboard = function(){
+  try{
+    var modal = document.getElementById('stockDashboard');
+    if(modal) modal.classList.remove('on');
+    // Body scroll geri ac
+    document.body.style.overflow = '';
+    document.body.style.position = '';
+    document.body.style.width = '';
+    // Chart temizle
+    if(_sd.chart){ try{_sd.chart.remove();}catch(e){} _sd.chart=null; }
+    if(_sd.rsiChart){ try{_sd.rsiChart.remove();}catch(e){} _sd.rsiChart=null; }
+  }catch(e){}
+};
+
+//  7. buildLWChart - OHLCV field fix 
+var _origBuildLWC = typeof buildLWChart === 'function' ? buildLWChart : null;
+if(_origBuildLWC){
+  window.buildLWChart = function(ohlcv){
+    // ohlcv param normalize
+    if(!ohlcv && _sd.ohlcv){
+      ohlcv = _sd.ohlcv.ohlcv || _sd.ohlcv.data;
+    }
+    if(!ohlcv || !ohlcv.length){
+      console.warn('buildLWChart: veri yok');
+      return;
+    }
+    try{ _origBuildLWC(ohlcv); }catch(e){
+      console.warn('LWC error:',e.message);
+      // Canvas fallback
+      renderCanvasChart(ohlcv);
+    }
+  };
+}
+
+//  LOG 
+setTimeout(function(){
+  try{
+    console.log('[Blok29] Dashboard: tam ekran + LWC fallback + OHLCV fix aktif');
+    if(typeof devLog==='function') devLog('Blok29: Dashboard tam duzeltildi','ok');
+  }catch(e){}
+}, 1500);
+
+})();
+
+</script>
+<script>
+
+// BIST ELITE v3 - BLOK 30: TUM HISSELER ICIN PINE TABLOLAR
+// openSt() override - her hissede Pine tablo goster
+// Proxy /scan_single ile sys1/sys2/fusion/master_ai ceker
+
+(function(){
+'use strict';
+
+var PROXY2 = typeof PROXY_URL !== 'undefined' ? PROXY_URL : 'https://bist-price-proxy.onrender.com';
+
+// openSt OVERRIDE
+var _origOpenSt = typeof openSt === 'function' ? openSt : null;
+
+window.openSt = function(t){
+  try{
+    var stk = (typeof STOCKS !== 'undefined' ? STOCKS : []).find(function(s){ return s.t===t; });
+    var si = (S.sigs||[]).findIndex(function(s){ return s.ticker===t; });
+    var title = t + (stk?' — '+stk.n:'');
+
+    if(si > -1){
+      if(_origOpenSt) _origOpenSt(t);
+      setTimeout(function(){
+        var mc = document.getElementById('mcont');
+        if(mc && mc.innerHTML.indexOf('pineTbl30') === -1){
+          _fetchPine(t, 'D', mc);
+        }
+      }, 200);
+      return;
+    }
+
+    var modal = document.getElementById('modal');
+    var mtit  = document.getElementById('mtit');
+    var mc    = document.getElementById('mcont');
+    if(!modal || !mc) return;
+    if(mtit) mtit.textContent = title;
+    mc.innerHTML = _spinHTML(t);
+    modal.classList.add('on');
+
+    var tf = (S.tfFilter && S.tfFilter.length) ? S.tfFilter[0] : 'D';
+    _fetchPine(t, tf, mc);
+  }catch(e){ console.warn('openSt30:',e.message); if(_origOpenSt) _origOpenSt(t); }
+};
+
+function _fetchPine(ticker, tf, container){
+  try{
+    var cfg = typeof C !== 'undefined' ? {
+      atrm: C.atrm||8, fb: C.fb||80, sc: C.sc||5, adxMin: C.adxMin||25
+    } : {};
+    fetch(PROXY2+'/scan_single',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ticker:ticker, tf:tf, cfg:cfg})
+    })
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(!container || !container.isConnected) return;
+      container.innerHTML = d.data ? _renderPine(d.data, ticker, tf) : _noDataHTML(ticker, tf, d.error);
+    })
+    .catch(function(e){
+      if(container && container.isConnected)
+        container.innerHTML = _noDataHTML(ticker, tf, e.message);
+    });
+  }catch(e){ console.warn('_fetchPine:',e.message); }
+}
+
+function _renderPine(res, ticker, tf){
+  var tfL = {D:'Gunluk','240':'4 Saat','120':'2 Saat'}[tf]||tf;
+  var html = '<div id="pineTbl30" style="padding:4px 0">';
+
+  // Fiyat/ozet satiri
+  var price  = res.price||'';
+  var cons   = res.consensus||res.cons||'';
+  var adx    = res.adx||'';
+  var pstate = res.pstate||'';
+  var signal = res.signal||'';
+  var isMst  = res.is_master||false;
+  var sigColor= isMst?'var(--gold)':signal==='buy'?'var(--green)':'var(--t3)';
+  var sigLbl = isMst?'MASTER AI':signal==='buy'?'AL':'TARASILDI';
+
+  if(price||cons||adx){
+    html += '<div style="display:flex;align-items:center;gap:6px;padding:8px;background:rgba(255,255,255,.03);border-radius:10px;margin-bottom:8px;border:1px solid rgba(255,255,255,.06)">'
+      +'<div style="flex:1">'
+      +(price?'<div style="font-size:18px;font-weight:700;color:var(--t1)">TL'+parseFloat(price).toFixed(2)+'</div>':'')
+      +'<div style="font-size:9px;color:var(--t4)">'+tfL+'</div>'
+      +'</div>'
+      +(cons?'<div style="text-align:center"><div style="font-size:14px;font-weight:700;color:var(--cyan)">%'+parseFloat(cons).toFixed(0)+'</div><div style="font-size:8px;color:var(--t4)">Konsensus</div></div>':'')
+      +(adx?'<div style="text-align:center"><div style="font-size:14px;font-weight:700;color:var(--purple)">'+parseFloat(adx).toFixed(0)+'</div><div style="font-size:8px;color:var(--t4)">ADX</div></div>':'')
+      +(pstate?'<div style="text-align:center"><div style="font-size:9px;font-weight:700;color:'+(pstate.indexOf('UCUZ')>-1?'var(--green)':pstate.indexOf('PAHALI')>-1?'var(--red)':'var(--t3)')+'">'+pstate+'</div><div style="font-size:8px;color:var(--t4)">Bolge</div></div>':'')
+      +(signal?'<div style="padding:4px 8px;border-radius:6px;background:'+sigColor+'22;border:1px solid '+sigColor+'55;font-size:9px;font-weight:700;color:'+sigColor+'">'+sigLbl+'</div>':'')
+      +'</div>';
+  }
+
+  // 4 sistem tablosu
+  var tbls = [
+    {k:'sys1',    l:'Sistem 1 (SuperTrend+TMA)', c:'#00D4FF'},
+    {k:'sys2',    l:'PRO Engine (6 Faktor)',      c:'#00E676'},
+    {k:'fusion',  l:'Fusion AI',                  c:'#C084FC'},
+    {k:'master_ai',l:'Master AI Konsensus',       c:'#FFB800'},
+  ];
+  var hasAny=false;
+  tbls.forEach(function(tbl){
+    var d=res[tbl.k];
+    if(!d) return;
+    hasAny=true;
+    var buys=d.buys||0, wins=d.wins||0, losses=d.losses||0, sells=d.sells||0;
+    var pnl=parseFloat(d.total_pnl||0).toFixed(1);
+    var op=d.open_pnl!==undefined?parseFloat(d.open_pnl).toFixed(1):null;
+    var wr=buys>0?((wins/buys)*100).toFixed(0):'0';
+    var wrC=parseFloat(wr)>=55?'var(--green)':parseFloat(wr)>=45?'var(--gold)':'var(--red)';
+    var pC=parseFloat(pnl)>0?'var(--green)':parseFloat(pnl)<0?'var(--red)':'var(--t2)';
+
+    var extra='';
+    if(tbl.k==='master_ai'){
+      var bc=d.buy_consensus!==undefined?(parseFloat(d.buy_consensus)*100).toFixed(0)+'%':'';
+      var th=d.dyn_buy_thresh!==undefined?(parseFloat(d.dyn_buy_thresh)*100).toFixed(0)+'%':'';
+      if(bc) extra+='<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)"><span style="color:rgba(255,255,255,.4);font-size:9px">Consensus Buy</span><span style="color:var(--cyan);font-size:9px;font-weight:600">'+bc+'</span></div>';
+      if(th) extra+='<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)"><span style="color:rgba(255,255,255,.4);font-size:9px">Dyn Buy Thresh</span><span style="color:var(--gold);font-size:9px;font-weight:600">'+th+'</span></div>';
+    }
+    if(tbl.k==='sys2'&&res.pro_factors){
+      var pf=res.pro_factors;
+      var sc=(pf.rs_strong?1:0)+(pf.accum_d?1:0)+(pf.exp_4h?1:0)+(pf.break_4h?1:0)+(pf.mom_2h?1:0)+(pf.dna?1:0);
+      extra+='<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)"><span style="color:rgba(255,255,255,.4);font-size:9px">PRO Skor</span><span style="color:var(--green);font-size:9px;font-weight:600">'+sc+'/6</span></div>';
+    }
+
+    html+='<div style="background:rgba(10,10,20,.6);border:1px solid rgba(255,255,255,.07);border-left:3px solid '+tbl.c+';border-radius:10px;padding:10px;margin-bottom:6px">'
+      +'<div style="font-size:10px;font-weight:700;color:'+tbl.c+';margin-bottom:7px">'+tbl.l+'</div>'
+      +'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-bottom:7px">'
+      +_sbox('Toplam AL',buys,'var(--cyan)')
+      +_sbox('Karl./Zar.',wins+'K/'+losses+'Z',wrC)
+      +_sbox('Win%',wr+'%',wrC)
+      +_sbox('Toplam PnL',pnl+'%',pC)
+      +'</div>'
+      +(sells?'<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)"><span style="color:rgba(255,255,255,.4);font-size:9px">Toplam SAT</span><span style="color:var(--t2);font-size:9px;font-weight:600">'+sells+'</span></div>':'')
+      +(op!==null?'<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)"><span style="color:rgba(255,255,255,.4);font-size:9px">Pozisyon PnL</span><span style="color:'+(parseFloat(op)>0?'var(--green)':parseFloat(op)<0?'var(--red)':'var(--t4)')+';font-size:9px;font-weight:600">'+(parseFloat(op)!==0?op+'%':'YOK')+'</span></div>':'')
+      +extra+'</div>';
+  });
+
+  // Agents
+  if(res.agents){
+    html+='<div style="background:rgba(10,10,20,.6);border:1px solid rgba(255,255,255,.07);border-left:3px solid rgba(255,100,50,.7);border-radius:10px;padding:10px;margin-bottom:6px">'
+      +'<div style="font-size:10px;font-weight:700;color:rgba(255,150,100,1);margin-bottom:7px">Agent Grubu</div>'
+      +'<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:3px">';
+    ['a60','a61','a62','a81','a120'].forEach(function(ak){
+      var a=res.agents[ak];
+      if(!a) return;
+      var ap=parseFloat(a.pnl||0).toFixed(1);
+      var ac=parseFloat(ap)>0?'var(--green)':parseFloat(ap)<0?'var(--red)':'var(--t4)';
+      html+='<div style="text-align:center;background:rgba(255,255,255,.03);border-radius:7px;padding:6px 2px">'
+        +'<div style="font-size:7px;color:var(--t4);margin-bottom:2px">'+ak.toUpperCase()+'</div>'
+        +'<div style="font-size:10px;font-weight:700;color:'+ac+'">'+ap+'%</div>'
+        +'<div style="font-size:7px;color:var(--t4)">'+(a.buys||0)+' AL</div>'
+        +'</div>';
+    });
+    html+='</div></div>';
+  }
+
+  if(!hasAny) html+='<div style="padding:16px;text-align:center;color:var(--t4);font-size:11px">Backtest verisi bulunamadi.</div>';
+
+  // Alt butonlar
+  var tvTf={D:'1D','240':'4H','120':'2H'}[tf]||'1D';
+  html+='<div style="margin-top:8px;display:flex;gap:6px">'
+    +'<button onclick="window.open(\'https://www.tradingview.com/chart/?symbol=BIST:'+ticker+'&interval='+tvTf+'\')" '
+    +'style="flex:1;padding:9px;border-radius:8px;background:rgba(0,212,255,.1);border:1px solid rgba(0,212,255,.2);color:var(--cyan);font-size:10px;cursor:pointer;font-weight:600">TV Grafik</button>'
+    +'<button onclick="pine30TF(\''+ticker+'\',\''+tf+'\')" '
+    +'style="flex:1;padding:9px;border-radius:8px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);color:var(--t3);font-size:10px;cursor:pointer">TF Degistir</button>'
+    +'</div>'
+    +'</div>';
+  return html;
+}
+
+window.pine30TF=function(ticker,cur){
+  var tfs=['D','240','120'];
+  var next=tfs[(tfs.indexOf(cur)+1)%tfs.length];
+  var mc=document.getElementById('mcont');
+  if(mc){ mc.innerHTML=_spinHTML(ticker); _fetchPine(ticker,next,mc); }
+  if(typeof toast==='function') toast({D:'Gunluk','240':'4 Saat','120':'2 Saat'}[next]+' yukleniyor...');
+};
+
+function _sbox(l,v,c){
+  return '<div style="background:rgba(255,255,255,.03);border-radius:7px;padding:7px 3px;text-align:center">'
+    +'<div style="font-size:11px;font-weight:700;color:'+c+'">'+v+'</div>'
+    +'<div style="font-size:7px;color:rgba(255,255,255,.3);margin-top:2px">'+l+'</div>'
+    +'</div>';
+}
+
+function _spinHTML(t){
+  return '<div style="padding:30px;text-align:center">'
+    +'<div style="display:inline-block;width:28px;height:28px;border:2px solid rgba(0,212,255,.15);border-top-color:var(--cyan);border-radius:50%;animation:spin30 .8s linear infinite;margin-bottom:12px"></div>'
+    +'<div style="font-size:11px;color:var(--cyan);font-weight:600">'+t+'</div>'
+    +'<div style="font-size:9px;color:var(--t4);margin-top:4px">Pine tablolar yukleniyor (2 yil / 504 bar)</div>'
+    +'</div>';
+}
+
+function _noDataHTML(t,tf,err){
+  return '<div style="padding:20px;text-align:center">'
+    +'<div style="font-size:11px;color:var(--t2);margin-bottom:4px">'+t+'</div>'
+    +'<div style="font-size:9px;color:var(--t4);margin-bottom:12px">'+(err||'Veri alinamadi')+'</div>'
+    +'<div style="display:flex;gap:6px;justify-content:center">'
+    +'<button onclick="openSt(\''+t+'\')" style="padding:8px 14px;border-radius:8px;background:rgba(0,212,255,.1);border:1px solid rgba(0,212,255,.2);color:var(--cyan);font-size:10px;cursor:pointer">Tekrar Dene</button>'
+    +'<button onclick="window.open(\'https://www.tradingview.com/chart/?symbol=BIST:'+t+'\')" style="padding:8px 14px;border-radius:8px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);color:var(--t3);font-size:10px;cursor:pointer">TV Grafik</button>'
+    +'</div></div>';
+}
+
+(function(){
+  try{
+    if(!document.getElementById('spin30css')){
+      var st=document.createElement('style');
+      st.id='spin30css';
+      st.textContent='@keyframes spin30{to{transform:rotate(360deg)}}';
+      document.head.appendChild(st);
+    }
+  }catch(e){}
+})();
+
+setTimeout(function(){
+  try{
+    console.log('[Blok30] Pine tablo: tum 424 hisse icin aktif');
+    if(typeof devLog==='function') devLog('Blok30: Pine tablo 424 hisse OK','ok');
+  }catch(e){}
+},2000);
+
+})();
+
+</script>
+<script>
+
+// BIST ELITE v3 - BLOK 30: TUM HISSELER ICIN PINE TABLOLARI
+(function(){
+'use strict';
+
+// CSS
+(function(){
+  try{
+    var st = document.createElement('style');
+    st.textContent =
+      '#pineModal{position:fixed;inset:0;z-index:10020;background:rgba(0,0,0,.92);display:none;flex-direction:column;-webkit-overflow-scrolling:touch;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}'
+      +'#pineModal.on{display:flex}'
+      +'.pineHdr{display:flex;align-items:center;gap:10px;padding:12px 14px;background:rgba(5,5,20,.98);border-bottom:1px solid rgba(255,255,255,.08);flex-shrink:0}'
+      +'.pineHdrBack{min-width:44px;min-height:44px;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.06);border-radius:9px;cursor:pointer;font-size:18px;color:var(--t2);border:none}'
+      +'.pineHdrInfo{flex:1}'
+      +'.pineHdrTicker{font-size:16px;font-weight:700;color:var(--t1)}'
+      +'.pineHdrName{font-size:9px;color:var(--t4)}'
+      +'.pineTFbtns{display:flex;gap:4px}'
+      +'.pineTFbtn{padding:5px 10px;border-radius:7px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.04);color:var(--t3);font-size:10px;cursor:pointer}'
+      +'.pineTFbtn.active{background:rgba(0,212,255,.15);border-color:rgba(0,212,255,.4);color:var(--cyan)}'
+      +'.pineBody{flex:1;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;padding:10px;min-height:0}'
+      +'.pineLoading{display:flex;flex-direction:column;align-items:center;justify-content:center;height:200px;gap:12px}'
+      +'.pineSpinner{width:32px;height:32px;border-radius:50%;border:3px solid rgba(0,212,255,.2);border-top-color:var(--cyan);animation:pineSpin .7s linear infinite}'
+      +'@keyframes pineSpin{to{transform:rotate(360deg)}}'
+      +'.pineGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}'
+      +'.pineBox{background:rgba(10,10,20,.9);border:1px solid rgba(255,255,255,.1);border-radius:11px;padding:10px}'
+      +'.pineBoxTitle{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid rgba(255,255,255,.07)}'
+      +'.pineRow{display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)}'
+      +'.pineRow:last-child{border-bottom:none}'
+      +'.pineLabel{font-size:9px;color:rgba(255,255,255,.45)}'
+      +'.pineVal{font-size:9px;font-weight:700;font-family:Courier New,monospace}'
+      +'.pineBoxFull{background:rgba(10,10,20,.9);border:1px solid rgba(255,255,255,.1);border-radius:11px;padding:10px;margin-bottom:8px}'
+      +'.pineAgentRow{display:flex;align-items:center;gap:6px;padding:4px 0}'
+      +'.pineAgentLabel{font-size:9px;color:rgba(255,255,255,.5);width:35px}'
+      +'.pineAgentBarWrap{flex:1;height:14px;background:rgba(255,255,255,.06);border-radius:4px;overflow:hidden}'
+      +'.pineAgentBar{height:100%;border-radius:4px;transition:width .4s ease}'
+      +'.pineAgentPnl{font-size:9px;font-weight:700;font-family:Courier New,monospace;width:55px;text-align:right}'
+      +'.pineScoreBadge{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px}'
+      +'.pineScorePill{padding:4px 9px;border-radius:20px;font-size:9px;font-weight:700;border:1px solid rgba(255,255,255,.1)}'
+      +'.pineTVBtn{display:block;width:100%;padding:11px;border-radius:10px;background:rgba(0,212,255,.12);border:1px solid rgba(0,212,255,.3);color:var(--cyan);font-size:11px;font-weight:700;text-align:center;cursor:pointer;margin-top:4px;box-sizing:border-box}'
+      +'.stPineBtn{padding:5px 9px;border-radius:7px;font-size:9px;font-weight:700;background:rgba(0,212,255,.1);border:1px solid rgba(0,212,255,.2);color:var(--cyan);cursor:pointer;flex-shrink:0;margin-left:6px}'
+      +'.stPineBtn:active{opacity:.7}'
+      +'.pineSigTab{padding:7px 12px;border-radius:8px;font-size:10px;font-weight:600;background:rgba(0,212,255,.1);border:1px solid rgba(0,212,255,.25);color:var(--cyan);cursor:pointer;display:inline-block;margin-bottom:8px}'
+    ;
+    document.head.appendChild(st);
+  }catch(e){}
+})();
+
+function ensurePineModal(){
+  if(document.getElementById('pineModal')) return;
+  var div = document.createElement('div');
+  div.id = 'pineModal';
+  div.innerHTML =
+    '<div class="pineHdr">'
+    +'<button class="pineHdrBack" onclick="closePineModal()">&#8592;</button>'
+    +'<div class="pineHdrInfo">'
+    +'<div class="pineHdrTicker" id="pineTicker">-</div>'
+    +'<div class="pineHdrName" id="pineName">Pine Script Tablolari</div>'
+    +'</div>'
+    +'<div class="pineTFbtns">'
+    +'<button class="pineTFbtn active" data-tf="D" onclick="loadPineTF(\'D\')">1G</button>'
+    +'<button class="pineTFbtn" data-tf="240" onclick="loadPineTF(\'240\')">4S</button>'
+    +'<button class="pineTFbtn" data-tf="120" onclick="loadPineTF(\'120\')">2S</button>'
+    +'</div>'
+    +'</div>'
+    +'<div class="pineBody" id="pineBody">'
+    +'<div class="pineLoading"><div class="pineSpinner"></div><span style="font-size:11px;color:var(--t4)">Yukleniyor...</span></div>'
+    +'</div>'
+  ;
+  document.body.appendChild(div);
+}
+
+var _pineTicker = null;
+var _pineTF = 'D';
+var _pineCache = {};
+
+window.openPineModal = function(ticker, name, tf){
+  try{
+    ensurePineModal();
+    _pineTicker = ticker;
+    _pineTF = tf || 'D';
+    var el = document.getElementById('pineModal');
+    if(el) el.classList.add('on');
+    var tEl = document.getElementById('pineTicker');
+    var nEl = document.getElementById('pineName');
+    if(tEl) tEl.textContent = ticker;
+    if(nEl) nEl.textContent = (name||ticker) + ' - Pine Script Tablolari';
+    document.querySelectorAll('.pineTFbtn').forEach(function(b){
+      b.classList.toggle('active', b.dataset.tf === _pineTF);
+    });
+    document.body.style.overflow = 'hidden';
+    document.body.style.position = 'fixed';
+    document.body.style.width = '100%';
+    loadPineData(ticker, _pineTF);
+    if(typeof haptic==='function') haptic('medium');
+  }catch(e){ console.warn('openPineModal:',e.message); }
+};
+
+window.closePineModal = function(){
+  try{
+    var el = document.getElementById('pineModal');
+    if(el) el.classList.remove('on');
+    document.body.style.overflow = '';
+    document.body.style.position = '';
+    document.body.style.width = '';
+  }catch(e){}
+};
+
+window.loadPineTF = function(tf){
+  try{
+    _pineTF = tf;
+    document.querySelectorAll('.pineTFbtn').forEach(function(b){
+      b.classList.toggle('active', b.dataset.tf === tf);
+    });
+    if(_pineTicker) loadPineData(_pineTicker, tf);
+  }catch(e){}
+};
+
+function loadPineData(ticker, tf){
+  try{
+    var body = document.getElementById('pineBody');
+    if(!body) return;
+    var cacheKey = ticker + '_' + tf;
+    if(_pineCache[cacheKey]){
+      renderPineData(_pineCache[cacheKey]);
+      return;
+    }
+    body.innerHTML = '<div class="pineLoading"><div class="pineSpinner"></div>'
+      +'<span style="font-size:11px;color:var(--t4)">'+ticker+' analiz ediliyor... (30sn surebilir)</span></div>';
+    var PROXY2 = typeof PROXY_URL!=='undefined' ? PROXY_URL : 'https://bist-price-proxy.onrender.com';
+    fetch(PROXY2+'/analyze/'+ticker+'?tf='+tf)
+      .then(function(r){ return r.json(); })
+      .then(function(data){
+        if(data && (data.sys1 || data.price)){
+          _pineCache[cacheKey] = data;
+          renderPineData(data);
+        } else {
+          body.innerHTML = '<div style="padding:30px;text-align:center;color:var(--t4);font-size:11px">'
+            +(data&&data.error?data.error:'Yeterli veri yok')+'<br><br>'
+            +'<button onclick="delete _pineCache[\''+cacheKey+'\'];loadPineData(\''+ticker+'\',\''+tf+'\')" '
+            +'style="padding:8px 16px;border-radius:8px;background:rgba(0,212,255,.1);border:1px solid rgba(0,212,255,.2);color:var(--cyan);font-size:10px;cursor:pointer">Tekrar Dene</button>'
+            +'</div>';
+        }
+      })
+      .catch(function(e){
+        body.innerHTML = '<div style="padding:30px;text-align:center">'
+          +'<div style="font-size:11px;color:var(--red);margin-bottom:10px">Baglanti hatasi: '+e.message+'</div>'
+          +'<button onclick="delete _pineCache[\''+cacheKey+'\'];loadPineData(\''+ticker+'\',\''+tf+'\')" '
+          +'style="padding:8px 16px;border-radius:8px;background:rgba(0,212,255,.1);border:1px solid rgba(0,212,255,.2);color:var(--cyan);font-size:10px;cursor:pointer">Tekrar Dene</button>'
+          +'</div>';
+      });
+  }catch(e){ console.warn('loadPineData:',e.message); }
+}
+
+function pineBox(title, color, d, extra){
+  if(!d) return '<div class="pineBox"><div class="pineBoxTitle" style="color:'+color+'">'+title+'</div>'
+    +'<div style="padding:20px;text-align:center;color:var(--t4);font-size:9px">Veri yok</div></div>';
+  var wr = d.buys>0 ? Math.round(d.wins/d.buys*100) : 0;
+  var wrClr = wr>=50 ? 'var(--green)' : 'var(--red)';
+  var pnlClr = (d.total_pnl||0)>=0 ? 'var(--green)' : 'var(--red)';
+  var openVal = (d.open_pnl!=null&&d.open_pnl!==0) ? (d.open_pnl>=0?'+':'')+d.open_pnl.toFixed(1)+'%' : 'YOK';
+  var openClr = (d.open_pnl!=null&&d.open_pnl!==0) ? (d.open_pnl>=0?'var(--green)':'var(--red)') : 'var(--t4)';
+  return '<div class="pineBox">'
+    +'<div class="pineBoxTitle" style="color:'+color+'">'+title+'</div>'
+    +'<div class="pineRow"><span class="pineLabel">Toplam AL</span><span class="pineVal" style="color:var(--t2)">'+(d.buys||0)+'</span></div>'
+    +'<div class="pineRow"><span class="pineLabel">Toplam SAT</span><span class="pineVal" style="color:var(--t2)">'+(d.sells||0)+'</span></div>'
+    +'<div class="pineRow"><span class="pineLabel">Karl/Zarar</span><span class="pineVal" style="color:'+wrClr+'">'+(d.wins||0)+'/'+(d.losses||0)+'</span></div>'
+    +'<div class="pineRow"><span class="pineLabel">Toplam %</span><span class="pineVal" style="color:'+pnlClr+'">'+((d.total_pnl||0)>=0?'+':'')+((d.total_pnl||0)).toFixed(2)+'%</span></div>'
+    +'<div class="pineRow"><span class="pineLabel">Pozisyon</span><span class="pineVal" style="color:'+openClr+'">'+openVal+'</span></div>'
+    +(extra?'<div class="pineRow"><span class="pineLabel">'+extra.split('|')[0]+'</span><span class="pineVal" style="color:var(--cyan)">'+extra.split('|')[1]+'</span></div>':'')
+    +'</div>';
+}
+
+function renderPineData(data){
+  try{
+    var body = document.getElementById('pineBody');
+    if(!body) return;
+    var html = '';
+
+    // Badge row
+    html += '<div class="pineScoreBadge">';
+    if(data.price) html += '<span class="pineScorePill" style="color:var(--cyan);border-color:rgba(0,212,255,.3)">TL'+(data.price||0).toFixed(2)+'</span>';
+    if(data.adx)   html += '<span class="pineScorePill" style="color:var(--gold);border-color:rgba(255,184,0,.3)">ADX '+(data.adx||0).toFixed(0)+'</span>';
+    if(data.cons)  html += '<span class="pineScorePill" style="color:var(--green);border-color:rgba(0,230,118,.3)">Kons %'+(data.cons||0).toFixed(0)+'</span>';
+    if(data.pstate) html += '<span class="pineScorePill" style="color:var(--purple);border-color:rgba(192,132,252,.3)">'+data.pstate+'</span>';
+    if(data.signal!==undefined){
+      var sigTxt = data.is_master ? 'MASTER AI' : data.signal ? 'AL' : 'BEKLE';
+      var sigClr = data.is_master ? 'var(--gold)' : data.signal ? 'var(--green)' : 'var(--t4)';
+      html += '<span class="pineScorePill" style="color:'+sigClr+'">'+sigTxt+'</span>';
+    }
+    html += '</div>';
+
+    // 4 kutu grid
+    html += '<div class="pineGrid">';
+    html += pineBox('Sistem 1', 'rgba(0,212,255,.8)', data.sys1);
+    html += pineBox('PRO Engine', 'rgba(192,132,252,.8)', data.sys2,
+      data.sys2 ? 'PRO Skor|'+(data.sys2.score||0)+'/6' : null);
+    html += pineBox('Fusion AI', 'rgba(0,230,118,.8)', data.fusion);
+
+    // Master AI kutu
+    if(data.master_ai){
+      var ma = data.master_ai;
+      html += '<div class="pineBox">'
+        +'<div class="pineBoxTitle" style="color:var(--gold)">Master AI</div>'
+        +'<div class="pineRow"><span class="pineLabel">Consensus Buy</span><span class="pineVal" style="color:var(--green)">%'+(ma.buy_consensus||0).toFixed(0)+'</span></div>'
+        +'<div class="pineRow"><span class="pineLabel">Consensus Sell</span><span class="pineVal" style="color:var(--red)">%'+(ma.sell_consensus||0).toFixed(0)+'</span></div>'
+        +'<div class="pineRow"><span class="pineLabel">Dyn Buy Thresh</span><span class="pineVal" style="color:var(--t2)">'+(ma.dyn_buy_thresh||0).toFixed(2)+'</span></div>'
+        +'<div class="pineRow"><span class="pineLabel">Dyn Sell Thresh</span><span class="pineVal" style="color:var(--t2)">'+(ma.dyn_sell_thresh||0).toFixed(2)+'</span></div>'
+        +'<div class="pineRow"><span class="pineLabel">Toplam PnL %</span><span class="pineVal" style="color:'+((ma.total_pnl||0)>=0?'var(--green)':'var(--red)')+'">'+((ma.total_pnl||0)>=0?'+':'')+((ma.total_pnl||0)).toFixed(2)+'%</span></div>'
+        +'<div class="pineRow"><span class="pineLabel">Pozisyon</span><span class="pineVal" style="color:var(--t4)">YOK</span></div>'
+        +'</div>';
+    } else {
+      html += '<div class="pineBox"><div class="pineBoxTitle" style="color:var(--gold)">Master AI</div>'
+        +'<div style="padding:20px;text-align:center;color:var(--t4);font-size:9px">Veri yok</div></div>';
+    }
+    html += '</div>'; // grid
+
+    // Agents
+    if(data.agents){
+      var ag = data.agents;
+      var agents = [
+        {k:'a60', lbl:'A60', d:ag.a60||{}},
+        {k:'a61', lbl:'A61', d:ag.a61||{}},
+        {k:'a62', lbl:'A62', d:ag.a62||{}},
+        {k:'a81', lbl:'A81', d:ag.a81||{}},
+        {k:'a120',lbl:'A120',d:ag.a120||{}},
+      ];
+      agents.forEach(function(a){
+        a.pnl = a.d.pnl || a.d.total_pnl || 0;
+      });
+      var best = agents.reduce(function(a,b){ return b.pnl > a.pnl ? b : a; }, agents[0]);
+      var maxPnl = Math.max.apply(null, agents.map(function(a){ return Math.abs(a.pnl)||1; }));
+
+      html += '<div class="pineGrid">';
+      html += '<div class="pineBox">'
+        +'<div class="pineBoxTitle" style="color:var(--purple)">EN IYI AGENT <span style="color:var(--gold)">'+best.lbl+'</span></div>'
+        +'<div class="pineRow"><span class="pineLabel">Toplam AL</span><span class="pineVal" style="color:var(--t2)">'+(best.d.buys||0)+'</span></div>'
+        +'<div class="pineRow"><span class="pineLabel">Toplam SAT</span><span class="pineVal" style="color:var(--t2)">'+(best.d.sells||0)+'</span></div>'
+        +'<div class="pineRow"><span class="pineLabel">Karl/Zarar</span><span class="pineVal" style="color:var(--t2)">'+(best.d.wins||0)+'/'+(best.d.losses||0)+'</span></div>'
+        +'<div class="pineRow"><span class="pineLabel">Toplam %</span><span class="pineVal" style="color:'+(best.pnl>=0?'var(--green)':'var(--red)')+'">'+( best.pnl>=0?'+':'')+best.pnl.toFixed(2)+'%</span></div>'
+        +'<div class="pineRow"><span class="pineLabel">Pozisyon</span><span class="pineVal" style="color:var(--t4)">YOK</span></div>'
+        +'<div class="pineRow"><span class="pineLabel">Fiyat Durumu</span><span class="pineVal" style="color:var(--t4)">--</span></div>'
+        +'</div>';
+
+      html += '<div class="pineBox">'
+        +'<div class="pineBoxTitle" style="color:var(--purple)">Agent  PnL %</div>'
+        +'<div style="display:flex;align-items:center;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)">'
+        +'<span style="font-size:8px;color:rgba(255,255,255,.4);width:30px">Agent</span>'
+        +'<span style="flex:1"></span>'
+        +'<span style="font-size:8px;color:rgba(255,255,255,.4)">PnL %</span>'
+        +'</div>';
+      agents.forEach(function(a){
+        var pct = Math.min(100, Math.abs(a.pnl) / maxPnl * 100);
+        var clr = a.pnl >= 0 ? '#00E676' : '#FF4444';
+        html += '<div class="pineAgentRow">'
+          +'<span class="pineAgentLabel">'+a.lbl+'</span>'
+          +'<div class="pineAgentBarWrap"><div class="pineAgentBar" style="width:'+pct.toFixed(0)+'%;background:'+clr+'"></div></div>'
+          +'<span class="pineAgentPnl" style="color:'+clr+'">'+( a.pnl>=0?'+':'')+a.pnl.toFixed(1)+'%</span>'
+          +'</div>';
+      });
+      html += '</div>';
+      html += '</div>'; // grid
+    }
+
+    // PRO Faktorler
+    if(data.pro_factors){
+      var pf = data.pro_factors;
+      var flist = [['rs_strong','RS Guclu'],['accum_d','Akumulasyon'],['exp_4h','4H Genisleme'],['break_4h','4H Kirilim'],['mom_2h','2H Momentum'],['dna','DNA Sinyal']];
+      html += '<div class="pineBoxFull"><div class="pineBoxTitle" style="color:var(--purple)">PRO Engine Faktorler</div>'
+        +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:2px">';
+      flist.forEach(function(f){
+        var v = pf[f[0]];
+        html += '<div class="pineRow"><span class="pineLabel">'+f[1]+'</span><span class="pineVal" style="color:'+(v?'var(--green)':'var(--t4)')+'">'+( v?'OK':'--')+'</span></div>';
+      });
+      html += '</div></div>';
+    }
+
+    // TV Butonu
+    var tfMap = {D:'1D','240':'4H','120':'2H'};
+    html += '<button class="pineTVBtn" onclick="window.open(\'https://www.tradingview.com/chart/?symbol=BIST:'
+      +(_pineTicker||'')+'&interval='+(tfMap[_pineTF]||'1D')+'\')">TradingView\'de Ac &#8599;</button>';
+
+    body.innerHTML = html;
+  }catch(e){ console.warn('renderPineData:',e.message); }
+}
+
+// Tarayici entegrasyonu
+var _b30_origRenderSt = typeof renderSt==='function' ? renderSt : null;
+window.renderSt = function(){
+  try{
+    if(_b30_origRenderSt) _b30_origRenderSt.apply(this, arguments);
+    setTimeout(injectPineBtns, 200);
+  }catch(e){ console.warn('renderSt b30:',e.message); }
+};
+
+function injectPineBtns(){
+  try{
+    document.querySelectorAll('.strow').forEach(function(row){
+      if(row.querySelector('.stPineBtn')) return;
+      var ticker = row.dataset.ticker || '';
+      var name = row.dataset.name || ticker;
+      if(!ticker) return;
+      var btn = document.createElement('button');
+      btn.className = 'stPineBtn';
+      btn.textContent = 'Pine';
+      btn.onclick = function(e){
+        e.stopPropagation();
+        openPineModal(ticker, name, 'D');
+      };
+      row.appendChild(btn);
+    });
+  }catch(e){}
+}
+
+// Sinyal detay'a Pine butonu
+var _b30_origOpenSig = typeof openSig==='function' ? openSig : null;
+window.openSig = function(idx){
+  try{
+    if(_b30_origOpenSig) _b30_origOpenSig.apply(this, arguments);
+    setTimeout(function(){
+      try{
+        var mcont = document.getElementById('mcont');
+        if(!mcont) return;
+        var sig = (S.sigs||[])[idx];
+        if(!sig) return;
+        if(document.getElementById('pineSigTabBtn')) return;
+        var btn = document.createElement('button');
+        btn.id = 'pineSigTabBtn';
+        btn.className = 'pineSigTab';
+        btn.textContent = 'Pine Tablolari';
+        btn.onclick = function(){ openPineModal(sig.ticker, sig.name, sig.tf); };
+        mcont.insertBefore(btn, mcont.firstChild);
+      }catch(e2){}
+    }, 400);
+  }catch(e){ console.warn('openSig b30:',e.message); }
+};
+
+// Load
+window.addEventListener('load', function(){
+  setTimeout(function(){
+    try{ injectPineBtns(); }catch(e){}
+    var st = document.getElementById('scannerTab');
+    if(st){ var orig=st.onclick; st.onclick=function(){ if(orig)orig.apply(this,arguments); setTimeout(injectPineBtns,500); }; }
+  }, 1500);
+});
+
+// ESC
+document.addEventListener('keydown', function(e){
+  if(e.key==='Escape'){ var pm=document.getElementById('pineModal'); if(pm&&pm.classList.contains('on')) closePineModal(); }
+});
+
+setTimeout(function(){
+  try{ console.log('[Blok30] Pine tablolari: Tum hisseler icin aktif'); if(typeof devLog==='function') devLog('Blok30: Pine modal hazir','ok'); }catch(e){}
+}, 2000);
+
+})();
+
+</script>
 </html>"""
 
 @app.get("/status")
@@ -15558,8 +17839,8 @@ async def root():
         online = len(ws_manager.connections)
     except:
         online = 0
-    return {"status":"ok","service":"BIST Elite v3","version":"3.0",
-            "blocks":25,"stocks":424,"scheduler":scheduler.running,
+    return {"status":"ok","service":"BIST Elite v3","version":"3.5",
+            "blocks":30,"stocks":424,"scheduler":scheduler.running,
             "cache":len(_cache),"tg_configured":bool(TG_TOKEN and TG_CHAT),
             "online_users":online}
 
